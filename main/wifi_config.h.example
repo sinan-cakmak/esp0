@@ -1,0 +1,15 @@
+/**
+ * WiFi Configuration Template
+ * 
+ * Copy this file to wifi_config.h and fill in your actual WiFi credentials.
+ * wifi_config.h is gitignored and will not be committed to the repository.
+ */
+
+#ifndef WIFI_CONFIG_H
+#define WIFI_CONFIG_H
+
+#define WIFI_SSID      "YOUR_WIFI_SSID_HERE"
+#define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD_HERE"
+
+#endif // WIFI_CONFIG_H
+
