@@ -389,19 +389,24 @@ static bool sync_bulb_with_toggle(void)
         return (ret == ESP_OK);
     }
     
+    // States match, no sync needed (don't log to reduce noise)
     sync_in_progress = false;
     return true;
 }
 
 /**
  * Toggle switch handler task - processes toggle position changes
+ * Uses polling as primary method with interrupts as fast path
  */
 void button_handler_task(void *pvParameters)
 {
     uint32_t notification_value;
     uint32_t last_change_time = 0;
-    const uint32_t DEBOUNCE_MS = 100;  // Increased debounce for toggle switch
+    const uint32_t DEBOUNCE_MS = 50;  // Debounce time
+    const uint32_t POLL_INTERVAL_MS = 100;  // Poll every 100ms to catch missed interrupts
+    const uint32_t SYNC_INTERVAL_MS = 2000;  // Full sync every 2 seconds
     int last_toggle_state = -1;  // Track previous state
+    uint32_t last_sync_time = 0;
     
     ESP_LOGI(WIZ_TAG, "Toggle switch handler task started");
     
@@ -428,30 +433,37 @@ void button_handler_task(void *pvParameters)
         sync_bulb_with_toggle();
     }
     
+    last_sync_time = xTaskGetTickCount();
+    
     while (1) {
-        // Wait for notification from ISR (toggle position changed) with timeout for periodic sync
-        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, pdMS_TO_TICKS(2000))) {
-            uint32_t now = xTaskGetTickCount();
-            
-            // Debounce
+        uint32_t now = xTaskGetTickCount();
+        bool interrupt_detected = false;
+        
+        // Check for interrupt notification (fast path) - non-blocking check
+        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0)) {
+            interrupt_detected = true;
+        }
+        
+        // Always poll the GPIO state (primary method - catches missed interrupts)
+        int current_toggle_state = read_toggle_state_debounced();
+        
+        // Check if state changed
+        if (current_toggle_state != last_toggle_state) {
+            // Debounce check
             if (now - last_change_time < pdMS_TO_TICKS(DEBOUNCE_MS)) {
+                // Too soon after last change - might be noise, wait a bit
+                vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
                 continue;
             }
+            
+            // State has changed and debounce passed - process it
             last_change_time = now;
-            
-            // Read current toggle state with debouncing
-            int current_toggle_state = read_toggle_state_debounced();
-            
-            // Only process if state actually changed
-            if (current_toggle_state == last_toggle_state) {
-                continue;
-            }
-            
             last_toggle_state = current_toggle_state;
             
             if (!wifi_connected) {
                 ESP_LOGW(WIZ_TAG, "WiFi not connected, cannot control bulb");
                 led_status_blink(3, 100);
+                vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
                 continue;
             }
             
@@ -471,12 +483,16 @@ void button_handler_task(void *pvParameters)
                 ESP_LOGE(WIZ_TAG, "Failed to send bulb command");
                 led_status_blink(2, 200); // Error indication
             }
-        } else {
-            // Timeout - periodic sync check
-            if (wifi_connected) {
-                sync_bulb_with_toggle();
-            }
         }
+        
+        // Periodic sync check (every 2 seconds)
+        if (wifi_connected && (now - last_sync_time >= pdMS_TO_TICKS(SYNC_INTERVAL_MS))) {
+            sync_bulb_with_toggle();
+            last_sync_time = now;
+        }
+        
+        // Poll interval - check toggle state frequently
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
     }
 }
 
