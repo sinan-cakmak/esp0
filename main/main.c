@@ -205,7 +205,7 @@ esp_err_t wiz_get_pilot(const char *bulb_ip, char *response_buffer, size_t buffe
 }
 
 /**
- * Turn WiZ bulb on or off
+ * Turn WiZ bulb on or off with retry logic
  */
 esp_err_t wiz_set_state(const char *bulb_ip, bool on)
 {
@@ -214,11 +214,28 @@ esp_err_t wiz_set_state(const char *bulb_ip, bool on)
              "{\"method\":\"setPilot\",\"params\":{\"state\":%s}}",
              on ? "true" : "false");
     
-    esp_err_t ret = wiz_send_command(bulb_ip, json_cmd);
-    if (ret == ESP_OK) {
-        bulb_state = on;
+    const int MAX_RETRIES = 3;
+    const int RETRY_DELAY_MS = 200;
+    
+    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        esp_err_t ret = wiz_send_command(bulb_ip, json_cmd);
+        if (ret == ESP_OK) {
+            bulb_state = on;
+            if (attempt > 0) {
+                ESP_LOGW(WIZ_TAG, "Bulb command succeeded on attempt %d", attempt + 1);
+            }
+            return ESP_OK;
+        }
+        
+        if (attempt < MAX_RETRIES - 1) {
+            ESP_LOGW(WIZ_TAG, "Bulb command failed, retrying in %dms (attempt %d/%d)", 
+                     RETRY_DELAY_MS, attempt + 1, MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
+        }
     }
-    return ret;
+    
+    ESP_LOGE(WIZ_TAG, "Failed to set bulb state after %d attempts", MAX_RETRIES);
+    return ESP_FAIL;
 }
 
 /**
@@ -266,10 +283,30 @@ static void IRAM_ATTR toggle_isr_handler(void* arg)
 }
 
 /**
+ * Read toggle switch state with debouncing (multiple reads)
+ */
+static int read_toggle_state_debounced(void)
+{
+    int readings[5];
+    int high_count = 0;
+    
+    // Take 5 readings with small delays
+    for (int i = 0; i < 5; i++) {
+        readings[i] = gpio_get_level(TOGGLE_GPIO);
+        if (readings[i] == 1) high_count++;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    
+    // Return majority state (HIGH if 3+ readings are HIGH)
+    return (high_count >= 3) ? 1 : 0;
+}
+
+/**
  * Initialize GPIO pin for toggle switch
  * Toggle switch connected between GPIO 4 and GND:
- * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb ON
- * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb OFF
+ * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb OFF (inverted)
+ * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb ON (inverted)
+ * Note: Logic is inverted because user reported toggle direction was wrong
  */
 void toggle_gpio_init(void)
 {
@@ -294,10 +331,10 @@ void toggle_gpio_init(void)
     
     gpio_isr_handler_add(TOGGLE_GPIO, toggle_isr_handler, NULL);
 
-    // Read initial state
-    int level = gpio_get_level(TOGGLE_GPIO);
+    // Read initial state with debouncing
+    int level = read_toggle_state_debounced();
     ESP_LOGI(WIZ_TAG, "Toggle switch GPIO %d initialized, current level: %d", TOGGLE_GPIO, level);
-    ESP_LOGI(WIZ_TAG, "Toggle ON (LOW/0) = Bulb ON, Toggle OFF (HIGH/1) = Bulb OFF");
+    ESP_LOGI(WIZ_TAG, "Toggle ON (HIGH/1) = Bulb ON, Toggle OFF (LOW/0) = Bulb OFF");
 }
 
 /**
@@ -325,26 +362,75 @@ void led_status_blink(uint32_t count, uint32_t delay_ms)
 }
 
 /**
+ * Sync bulb state with toggle switch state
+ * Returns true if sync was successful or not needed
+ */
+static bool sync_bulb_with_toggle(void)
+{
+    if (sync_in_progress || !wifi_connected) {
+        return false;
+    }
+    
+    sync_in_progress = true;
+    
+    // Read toggle state with debouncing
+    int toggle_state = read_toggle_state_debounced();
+    
+    // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
+    bool desired_bulb_state = (toggle_state == 1);
+    
+    // Only sync if bulb state doesn't match toggle state
+    if (bulb_state != desired_bulb_state) {
+        ESP_LOGI(WIZ_TAG, "Syncing: Toggle=%d (desired bulb=%s), Current bulb=%s", 
+                 toggle_state, desired_bulb_state ? "ON" : "OFF", bulb_state ? "ON" : "OFF");
+        
+        esp_err_t ret = wiz_set_state(WIZ_BULB_IP, desired_bulb_state);
+        sync_in_progress = false;
+        return (ret == ESP_OK);
+    }
+    
+    sync_in_progress = false;
+    return true;
+}
+
+/**
  * Toggle switch handler task - processes toggle position changes
  */
 void button_handler_task(void *pvParameters)
 {
     uint32_t notification_value;
     uint32_t last_change_time = 0;
-    const uint32_t DEBOUNCE_MS = 50;  // Shorter debounce for toggle switch
+    const uint32_t DEBOUNCE_MS = 100;  // Increased debounce for toggle switch
     int last_toggle_state = -1;  // Track previous state
     
     ESP_LOGI(WIZ_TAG, "Toggle switch handler task started");
     
-    // Read initial toggle state
-    last_toggle_state = gpio_get_level(TOGGLE_GPIO);
-    bulb_state = (last_toggle_state == 0);  // LOW (0) = ON, HIGH (1) = OFF
+    // Wait for WiFi before reading initial state
+    int wifi_wait = 0;
+    while (!wifi_connected && wifi_wait < 30) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wifi_wait++;
+    }
+    
+    if (!wifi_connected) {
+        ESP_LOGW(WIZ_TAG, "WiFi not connected, toggle handler will wait");
+    }
+    
+    // Read initial toggle state with debouncing
+    last_toggle_state = read_toggle_state_debounced();
+    // INVERTED: HIGH (1) = toggle ON = bulb ON
+    bulb_state = (last_toggle_state == 1);
     ESP_LOGI(WIZ_TAG, "Initial toggle state: %d (bulb should be %s)", 
              last_toggle_state, bulb_state ? "ON" : "OFF");
     
+    // Sync initial state
+    if (wifi_connected) {
+        sync_bulb_with_toggle();
+    }
+    
     while (1) {
-        // Wait for notification from ISR (toggle position changed)
-        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY)) {
+        // Wait for notification from ISR (toggle position changed) with timeout for periodic sync
+        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, pdMS_TO_TICKS(2000))) {
             uint32_t now = xTaskGetTickCount();
             
             // Debounce
@@ -353,8 +439,8 @@ void button_handler_task(void *pvParameters)
             }
             last_change_time = now;
             
-            // Read current toggle state
-            int current_toggle_state = gpio_get_level(TOGGLE_GPIO);
+            // Read current toggle state with debouncing
+            int current_toggle_state = read_toggle_state_debounced();
             
             // Only process if state actually changed
             if (current_toggle_state == last_toggle_state) {
@@ -369,24 +455,26 @@ void button_handler_task(void *pvParameters)
                 continue;
             }
             
-            // Toggle LOW (0) = switch ON = bulb ON
-            // Toggle HIGH (1) = switch OFF = bulb OFF
-            bool new_bulb_state = (current_toggle_state == 0);
+            // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
+            bool new_bulb_state = (current_toggle_state == 1);
             
             ESP_LOGI(WIZ_TAG, "*** TOGGLE CHANGED ***");
             ESP_LOGI(WIZ_TAG, "Toggle position: %s (GPIO level: %d)", 
-                     current_toggle_state == 0 ? "ON" : "OFF", current_toggle_state);
+                     current_toggle_state == 1 ? "ON" : "OFF", current_toggle_state);
             ESP_LOGI(WIZ_TAG, "Setting bulb %s", new_bulb_state ? "ON" : "OFF");
             
-            bulb_state = new_bulb_state;
-            
-            esp_err_t ret = wiz_set_state(WIZ_BULB_IP, bulb_state);
+            esp_err_t ret = wiz_set_state(WIZ_BULB_IP, new_bulb_state);
             if (ret == ESP_OK) {
                 ESP_LOGI(WIZ_TAG, "Bulb command sent successfully");
                 led_status_blink(1, 100); // Quick blink for feedback
             } else {
                 ESP_LOGE(WIZ_TAG, "Failed to send bulb command");
                 led_status_blink(2, 200); // Error indication
+            }
+        } else {
+            // Timeout - periodic sync check
+            if (wifi_connected) {
+                sync_bulb_with_toggle();
             }
         }
     }
