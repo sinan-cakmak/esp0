@@ -17,8 +17,8 @@
 #define WIZ_BULB_IP    "192.168.1.2"  // TODO: Replace with your bulb's IP address
 #define WIZ_PORT       38899
 
-// Button GPIO Configuration - Using BOOT button on ESP32
-#define BUTTON_GPIO    0  // BOOT button
+// Toggle Switch GPIO Configuration - Toggle switch between GPIO 4 and GND
+#define TOGGLE_GPIO    4  // Physical toggle switch
 
 // Status LED GPIO
 #define LED_STATUS_GPIO  2
@@ -30,6 +30,7 @@ static int udp_socket = -1;
 static bool wifi_connected = false;
 static bool bulb_state = false;
 static TaskHandle_t button_task_handle = NULL;
+static bool sync_in_progress = false;  // Prevent concurrent sync operations
 
 // Forward declarations
 esp_err_t wiz_udp_init(void);
@@ -38,7 +39,7 @@ esp_err_t wiz_receive_response(char *buffer, size_t buffer_size);
 esp_err_t wiz_get_pilot(const char *bulb_ip, char *response_buffer, size_t buffer_size);
 esp_err_t wiz_set_state(const char *bulb_ip, bool on);
 esp_err_t wiz_discover_and_test(const char *bulb_ip);
-void button_gpio_init(void);
+void toggle_gpio_init(void);
 void led_status_init(void);
 void led_status_blink(uint32_t count, uint32_t delay_ms);
 
@@ -250,34 +251,37 @@ esp_err_t wiz_discover_and_test(const char *bulb_ip)
 // ========== Button GPIO Functions ==========
 
 /**
- * IRAM_ATTR ISR handler for button interrupt
+ * IRAM_ATTR ISR handler for toggle switch interrupt
  */
-static void IRAM_ATTR button_isr_handler(void* arg)
+static void IRAM_ATTR toggle_isr_handler(void* arg)
 {
     if (button_task_handle == NULL) {
         return; // Task not ready yet
     }
     
-    // Notify the button handler task
+    // Notify the toggle handler task
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xTaskNotifyFromISR(button_task_handle, 1, eSetBits, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 /**
- * Initialize GPIO pin for BOOT button
+ * Initialize GPIO pin for toggle switch
+ * Toggle switch connected between GPIO 4 and GND:
+ * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb ON
+ * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb OFF
  */
-void button_gpio_init(void)
+void toggle_gpio_init(void)
 {
-    // First, check current GPIO state
-    gpio_reset_pin(BUTTON_GPIO);
+    // Reset GPIO pin
+    gpio_reset_pin(TOGGLE_GPIO);
     
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_NEGEDGE,  // Interrupt on falling edge (button press)
+        .intr_type = GPIO_INTR_ANYEDGE,  // Interrupt on both edges (toggle position change)
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << BUTTON_GPIO),
+        .pin_bit_mask = (1ULL << TOGGLE_GPIO),
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,  // Pull-up so open switch reads HIGH
     };
     gpio_config(&io_conf);
 
@@ -288,12 +292,12 @@ void button_gpio_init(void)
         isr_service_installed = true;
     }
     
-    gpio_isr_handler_add(BUTTON_GPIO, button_isr_handler, NULL);
+    gpio_isr_handler_add(TOGGLE_GPIO, toggle_isr_handler, NULL);
 
     // Read initial state
-    int level = gpio_get_level(BUTTON_GPIO);
-    ESP_LOGI(WIZ_TAG, "Button GPIO %d (BOOT button) initialized, current level: %d", BUTTON_GPIO, level);
-    ESP_LOGI(WIZ_TAG, "Button should be HIGH (1) when not pressed, LOW (0) when pressed");
+    int level = gpio_get_level(TOGGLE_GPIO);
+    ESP_LOGI(WIZ_TAG, "Toggle switch GPIO %d initialized, current level: %d", TOGGLE_GPIO, level);
+    ESP_LOGI(WIZ_TAG, "Toggle ON (LOW/0) = Bulb ON, Toggle OFF (HIGH/1) = Bulb OFF");
 }
 
 /**
@@ -321,26 +325,43 @@ void led_status_blink(uint32_t count, uint32_t delay_ms)
 }
 
 /**
- * Button handler task - processes button presses
+ * Toggle switch handler task - processes toggle position changes
  */
 void button_handler_task(void *pvParameters)
 {
     uint32_t notification_value;
-    uint32_t last_press_time = 0;
-    const uint32_t DEBOUNCE_MS = 300;
+    uint32_t last_change_time = 0;
+    const uint32_t DEBOUNCE_MS = 50;  // Shorter debounce for toggle switch
+    int last_toggle_state = -1;  // Track previous state
     
-    ESP_LOGI(WIZ_TAG, "Button handler task started");
+    ESP_LOGI(WIZ_TAG, "Toggle switch handler task started");
+    
+    // Read initial toggle state
+    last_toggle_state = gpio_get_level(TOGGLE_GPIO);
+    bulb_state = (last_toggle_state == 0);  // LOW (0) = ON, HIGH (1) = OFF
+    ESP_LOGI(WIZ_TAG, "Initial toggle state: %d (bulb should be %s)", 
+             last_toggle_state, bulb_state ? "ON" : "OFF");
     
     while (1) {
-        // Wait for notification from ISR
+        // Wait for notification from ISR (toggle position changed)
         if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, portMAX_DELAY)) {
             uint32_t now = xTaskGetTickCount();
             
             // Debounce
-            if (now - last_press_time < pdMS_TO_TICKS(DEBOUNCE_MS)) {
+            if (now - last_change_time < pdMS_TO_TICKS(DEBOUNCE_MS)) {
                 continue;
             }
-            last_press_time = now;
+            last_change_time = now;
+            
+            // Read current toggle state
+            int current_toggle_state = gpio_get_level(TOGGLE_GPIO);
+            
+            // Only process if state actually changed
+            if (current_toggle_state == last_toggle_state) {
+                continue;
+            }
+            
+            last_toggle_state = current_toggle_state;
             
             if (!wifi_connected) {
                 ESP_LOGW(WIZ_TAG, "WiFi not connected, cannot control bulb");
@@ -348,11 +369,16 @@ void button_handler_task(void *pvParameters)
                 continue;
             }
             
-            ESP_LOGI(WIZ_TAG, "*** BUTTON PRESSED ***");
+            // Toggle LOW (0) = switch ON = bulb ON
+            // Toggle HIGH (1) = switch OFF = bulb OFF
+            bool new_bulb_state = (current_toggle_state == 0);
             
-            // Toggle bulb state
-            bulb_state = !bulb_state;
-            ESP_LOGI(WIZ_TAG, "Toggling bulb %s", bulb_state ? "ON" : "OFF");
+            ESP_LOGI(WIZ_TAG, "*** TOGGLE CHANGED ***");
+            ESP_LOGI(WIZ_TAG, "Toggle position: %s (GPIO level: %d)", 
+                     current_toggle_state == 0 ? "ON" : "OFF", current_toggle_state);
+            ESP_LOGI(WIZ_TAG, "Setting bulb %s", new_bulb_state ? "ON" : "OFF");
+            
+            bulb_state = new_bulb_state;
             
             esp_err_t ret = wiz_set_state(WIZ_BULB_IP, bulb_state);
             if (ret == ESP_OK) {
@@ -401,16 +427,16 @@ void app_main(void)
     wiz_discover_and_test(WIZ_BULB_IP);
     ESP_LOGI(WIZ_TAG, "");
     
-    // Create button handler task FIRST (before initializing GPIO)
-    xTaskCreate(button_handler_task, "button_handler", 4096, NULL, 10, &button_task_handle);
+    // Create toggle handler task FIRST (before initializing GPIO)
+    xTaskCreate(button_handler_task, "toggle_handler", 4096, NULL, 10, &button_task_handle);
     vTaskDelay(pdMS_TO_TICKS(100)); // Give task time to start
     
-    // Initialize button GPIO (after task is created)
-    button_gpio_init();
+    // Initialize toggle switch GPIO (after task is created)
+    toggle_gpio_init();
     
     ESP_LOGI(WIZ_TAG, "========================================");
     ESP_LOGI(WIZ_TAG, "System ready!");
-    ESP_LOGI(WIZ_TAG, "Press BOOT button (GPIO %d) to toggle bulb", BUTTON_GPIO);
+    ESP_LOGI(WIZ_TAG, "Toggle switch on GPIO %d controls bulb", TOGGLE_GPIO);
     ESP_LOGI(WIZ_TAG, "Bulb IP: %s", WIZ_BULB_IP);
     ESP_LOGI(WIZ_TAG, "========================================");
     
