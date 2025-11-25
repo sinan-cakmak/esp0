@@ -13,24 +13,46 @@
 #include "driver/gpio.h"
 #include "wifi_config.h"
 
-// WiZ Bulb Configuration - UPDATE THIS with your bulb's IP address
-#define WIZ_BULB_IP    "192.168.1.2"  // TODO: Replace with your bulb's IP address
+// WiZ Bulb Configuration
 #define WIZ_PORT       38899
+#define NUM_SWITCHES   5
+#define MAX_BULBS_PER_SWITCH 2
 
-// Toggle Switch GPIO Configuration - Toggle switch between GPIO 4 and GND
-#define TOGGLE_GPIO    4  // Physical toggle switch
+// Toggle Switch GPIO Configuration - 5 switches
+#define SWITCH_GPIO_1    4   // Switch 1: GPIO 4
+#define SWITCH_GPIO_2    5   // Switch 2: GPIO 5
+#define SWITCH_GPIO_3    18  // Switch 3: GPIO 18
+#define SWITCH_GPIO_4    19  // Switch 4: GPIO 19
+#define SWITCH_GPIO_5    21  // Switch 5: GPIO 21
 
 // Status LED GPIO
 #define LED_STATUS_GPIO  2
+
+// Switch and Bulb Configuration Structure
+typedef struct {
+    int gpio_pin;
+    const char* bulb_ips[MAX_BULBS_PER_SWITCH];
+    int num_bulbs;
+    bool last_state;
+    bool bulb_states[MAX_BULBS_PER_SWITCH];
+} switch_config_t;
 
 static const char *TAG = "wifi";
 static const char *WIZ_TAG = "wiz";
 
 static int udp_socket = -1;
 static bool wifi_connected = false;
-static bool bulb_state = false;
 static TaskHandle_t button_task_handle = NULL;
 static bool sync_in_progress = false;  // Prevent concurrent sync operations
+
+// Switch configurations - one switch controls bulbs 2&3 together
+static switch_config_t switches[NUM_SWITCHES] = {
+    {SWITCH_GPIO_1, {"192.168.1.2", "192.168.1.3"}, 2, -1, {false, false}},  // Switch 1: Bulbs 2 & 3
+    {SWITCH_GPIO_2, {"192.168.1.4"}, 1, -1, {false}},                        // Switch 2: Bulb 4
+    {SWITCH_GPIO_3, {"192.168.1.5"}, 1, -1, {false}},                        // Switch 3: Bulb 5
+    {SWITCH_GPIO_4, {"192.168.1.6"}, 1, -1, {false}},                        // Switch 4: Bulb 6
+    {SWITCH_GPIO_5, {"192.168.1.7"}, 1, -1, {false}}                         // Switch 5: Bulb 7
+};
 
 // Forward declarations
 esp_err_t wiz_udp_init(void);
@@ -220,7 +242,6 @@ esp_err_t wiz_set_state(const char *bulb_ip, bool on)
     for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
         esp_err_t ret = wiz_send_command(bulb_ip, json_cmd);
         if (ret == ESP_OK) {
-            bulb_state = on;
             if (attempt > 0) {
                 ESP_LOGW(WIZ_TAG, "Bulb command succeeded on attempt %d", attempt + 1);
             }
@@ -269,6 +290,7 @@ esp_err_t wiz_discover_and_test(const char *bulb_ip)
 
 /**
  * IRAM_ATTR ISR handler for toggle switch interrupt
+ * arg contains the switch index
  */
 static void IRAM_ATTR toggle_isr_handler(void* arg)
 {
@@ -276,23 +298,24 @@ static void IRAM_ATTR toggle_isr_handler(void* arg)
         return; // Task not ready yet
     }
     
-    // Notify the toggle handler task
+    // Notify the toggle handler task (pass switch index in notification)
+    uint32_t switch_index = (uint32_t)arg;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xTaskNotifyFromISR(button_task_handle, 1, eSetBits, &xHigherPriorityTaskWoken);
+    xTaskNotifyFromISR(button_task_handle, (1UL << switch_index), eSetBits, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 /**
  * Read toggle switch state with debouncing (multiple reads)
  */
-static int read_toggle_state_debounced(void)
+static int read_toggle_state_debounced(int gpio_pin)
 {
     int readings[5];
     int high_count = 0;
     
     // Take 5 readings with small delays
     for (int i = 0; i < 5; i++) {
-        readings[i] = gpio_get_level(TOGGLE_GPIO);
+        readings[i] = gpio_get_level(gpio_pin);
         if (readings[i] == 1) high_count++;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
@@ -302,21 +325,28 @@ static int read_toggle_state_debounced(void)
 }
 
 /**
- * Initialize GPIO pin for toggle switch
- * Toggle switch connected between GPIO 4 and GND:
+ * Initialize GPIO pins for all toggle switches
+ * Toggle switches connected between GPIO pins and GND:
  * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb OFF (inverted)
  * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb ON (inverted)
  * Note: Logic is inverted because user reported toggle direction was wrong
  */
 void toggle_gpio_init(void)
 {
-    // Reset GPIO pin
-    gpio_reset_pin(TOGGLE_GPIO);
+    // Build pin mask for all switches
+    uint64_t pin_mask = 0;
     
+    // Reset all pins FIRST (before configuration)
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+        gpio_reset_pin(switches[i].gpio_pin);
+        pin_mask |= (1ULL << switches[i].gpio_pin);
+    }
+    
+    // Configure all switch GPIOs at once (AFTER reset)
     gpio_config_t io_conf = {
         .intr_type = GPIO_INTR_ANYEDGE,  // Interrupt on both edges (toggle position change)
         .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = (1ULL << TOGGLE_GPIO),
+        .pin_bit_mask = pin_mask,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .pull_up_en = GPIO_PULLUP_ENABLE,  // Pull-up so open switch reads HIGH
     };
@@ -329,11 +359,29 @@ void toggle_gpio_init(void)
         isr_service_installed = true;
     }
     
-    gpio_isr_handler_add(TOGGLE_GPIO, toggle_isr_handler, NULL);
-
-    // Read initial state with debouncing
-    int level = read_toggle_state_debounced();
-    ESP_LOGI(WIZ_TAG, "Toggle switch GPIO %d initialized, current level: %d", TOGGLE_GPIO, level);
+    // Add ISR handler for each switch (pass switch index as argument)
+    // NOTE: Do NOT call gpio_reset_pin() here - it would clear the config!
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+        gpio_isr_handler_add(switches[i].gpio_pin, toggle_isr_handler, (void*)i);
+        
+        // Read initial state with debouncing
+        int level = read_toggle_state_debounced(switches[i].gpio_pin);
+        switches[i].last_state = level;
+        
+        // Set initial bulb state (inverted: HIGH = ON)
+        bool desired_state = (level == 1);
+        for (int j = 0; j < switches[i].num_bulbs; j++) {
+            switches[i].bulb_states[j] = desired_state;
+        }
+        
+        ESP_LOGI(WIZ_TAG, "Switch %d (GPIO %d) initialized, level: %d, bulbs: %d", 
+                 i + 1, switches[i].gpio_pin, level, switches[i].num_bulbs);
+        for (int j = 0; j < switches[i].num_bulbs; j++) {
+            ESP_LOGI(WIZ_TAG, "  -> Bulb %d: %s", j + 1, switches[i].bulb_ips[j]);
+        }
+    }
+    
+    ESP_LOGI(WIZ_TAG, "All %d toggle switches initialized", NUM_SWITCHES);
     ESP_LOGI(WIZ_TAG, "Toggle ON (HIGH/1) = Bulb ON, Toggle OFF (LOW/0) = Bulb OFF");
 }
 
@@ -362,53 +410,79 @@ void led_status_blink(uint32_t count, uint32_t delay_ms)
 }
 
 /**
- * Sync bulb state with toggle switch state
- * Returns true if sync was successful or not needed
+ * Sync bulbs for a specific switch with its toggle state
  */
-static bool sync_bulb_with_toggle(void)
+static bool sync_switch_bulbs(int switch_idx)
+{
+    if (switch_idx < 0 || switch_idx >= NUM_SWITCHES || !wifi_connected) {
+        return false;
+    }
+    
+    switch_config_t* sw = &switches[switch_idx];
+    
+    // Read toggle state with debouncing
+    int toggle_state = read_toggle_state_debounced(sw->gpio_pin);
+    
+    // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
+    bool desired_bulb_state = (toggle_state == 1);
+    
+    bool all_synced = true;
+    
+    // Sync all bulbs for this switch
+    for (int i = 0; i < sw->num_bulbs; i++) {
+        if (sw->bulb_states[i] != desired_bulb_state) {
+            ESP_LOGI(WIZ_TAG, "Syncing Switch %d: Toggle=%d (bulb=%s), Bulb %s current=%s", 
+                     switch_idx + 1, toggle_state, desired_bulb_state ? "ON" : "OFF",
+                     sw->bulb_ips[i], sw->bulb_states[i] ? "ON" : "OFF");
+            
+            esp_err_t ret = wiz_set_state(sw->bulb_ips[i], desired_bulb_state);
+            if (ret == ESP_OK) {
+                sw->bulb_states[i] = desired_bulb_state;
+            } else {
+                all_synced = false;
+            }
+        }
+    }
+    
+    return all_synced;
+}
+
+/**
+ * Sync all switches with their bulbs
+ */
+static bool sync_all_switches(void)
 {
     if (sync_in_progress || !wifi_connected) {
         return false;
     }
     
     sync_in_progress = true;
+    bool all_ok = true;
     
-    // Read toggle state with debouncing
-    int toggle_state = read_toggle_state_debounced();
-    
-    // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
-    bool desired_bulb_state = (toggle_state == 1);
-    
-    // Only sync if bulb state doesn't match toggle state
-    if (bulb_state != desired_bulb_state) {
-        ESP_LOGI(WIZ_TAG, "Syncing: Toggle=%d (desired bulb=%s), Current bulb=%s", 
-                 toggle_state, desired_bulb_state ? "ON" : "OFF", bulb_state ? "ON" : "OFF");
-        
-        esp_err_t ret = wiz_set_state(WIZ_BULB_IP, desired_bulb_state);
-        sync_in_progress = false;
-        return (ret == ESP_OK);
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+        if (!sync_switch_bulbs(i)) {
+            all_ok = false;
+        }
     }
     
-    // States match, no sync needed (don't log to reduce noise)
     sync_in_progress = false;
-    return true;
+    return all_ok;
 }
 
 /**
- * Toggle switch handler task - processes toggle position changes
+ * Toggle switch handler task - processes toggle position changes for all switches
  * Uses polling as primary method with interrupts as fast path
  */
 void button_handler_task(void *pvParameters)
 {
     uint32_t notification_value;
-    uint32_t last_change_time = 0;
+    uint32_t last_change_times[NUM_SWITCHES] = {0};
     const uint32_t DEBOUNCE_MS = 50;  // Debounce time
     const uint32_t POLL_INTERVAL_MS = 100;  // Poll every 100ms to catch missed interrupts
     const uint32_t SYNC_INTERVAL_MS = 2000;  // Full sync every 2 seconds
-    int last_toggle_state = -1;  // Track previous state
     uint32_t last_sync_time = 0;
     
-    ESP_LOGI(WIZ_TAG, "Toggle switch handler task started");
+    ESP_LOGI(WIZ_TAG, "Toggle switch handler task started for %d switches", NUM_SWITCHES);
     
     // Wait for WiFi before reading initial state
     int wifi_wait = 0;
@@ -421,74 +495,104 @@ void button_handler_task(void *pvParameters)
         ESP_LOGW(WIZ_TAG, "WiFi not connected, toggle handler will wait");
     }
     
-    // Read initial toggle state with debouncing
-    last_toggle_state = read_toggle_state_debounced();
-    // INVERTED: HIGH (1) = toggle ON = bulb ON
-    bulb_state = (last_toggle_state == 1);
-    ESP_LOGI(WIZ_TAG, "Initial toggle state: %d (bulb should be %s)", 
-             last_toggle_state, bulb_state ? "ON" : "OFF");
-    
-    // Sync initial state
+    // Sync initial state for all switches
     if (wifi_connected) {
-        sync_bulb_with_toggle();
+        sync_all_switches();
     }
     
     last_sync_time = xTaskGetTickCount();
     
+    uint32_t debug_counter = 0;
+    
     while (1) {
         uint32_t now = xTaskGetTickCount();
-        bool interrupt_detected = false;
         
-        // Check for interrupt notification (fast path) - non-blocking check
-        if (xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0)) {
-            interrupt_detected = true;
-        }
+        // Check for interrupt notifications (fast path) - non-blocking check
+        // Note: We use polling as primary method, interrupts are just optimization
+        xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0);
         
-        // Always poll the GPIO state (primary method - catches missed interrupts)
-        int current_toggle_state = read_toggle_state_debounced();
-        
-        // Check if state changed
-        if (current_toggle_state != last_toggle_state) {
-            // Debounce check
-            if (now - last_change_time < pdMS_TO_TICKS(DEBOUNCE_MS)) {
-                // Too soon after last change - might be noise, wait a bit
-                vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
-                continue;
-            }
+        // Process each switch
+        for (int i = 0; i < NUM_SWITCHES; i++) {
+            switch_config_t* sw = &switches[i];
             
-            // State has changed and debounce passed - process it
-            last_change_time = now;
-            last_toggle_state = current_toggle_state;
+            // Read GPIO state directly (fast, single read for change detection)
+            int current_toggle_state = gpio_get_level(sw->gpio_pin);
             
-            if (!wifi_connected) {
-                ESP_LOGW(WIZ_TAG, "WiFi not connected, cannot control bulb");
-                led_status_blink(3, 100);
-                vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
-                continue;
-            }
-            
-            // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
-            bool new_bulb_state = (current_toggle_state == 1);
-            
-            ESP_LOGI(WIZ_TAG, "*** TOGGLE CHANGED ***");
-            ESP_LOGI(WIZ_TAG, "Toggle position: %s (GPIO level: %d)", 
-                     current_toggle_state == 1 ? "ON" : "OFF", current_toggle_state);
-            ESP_LOGI(WIZ_TAG, "Setting bulb %s", new_bulb_state ? "ON" : "OFF");
-            
-            esp_err_t ret = wiz_set_state(WIZ_BULB_IP, new_bulb_state);
-            if (ret == ESP_OK) {
-                ESP_LOGI(WIZ_TAG, "Bulb command sent successfully");
-                led_status_blink(1, 100); // Quick blink for feedback
-            } else {
-                ESP_LOGE(WIZ_TAG, "Failed to send bulb command");
-                led_status_blink(2, 200); // Error indication
+            // Check if state changed
+            if (current_toggle_state != sw->last_state) {
+                // Debounce check
+                if (now - last_change_times[i] < pdMS_TO_TICKS(DEBOUNCE_MS)) {
+                    // Too soon after last change - might be noise, skip this switch
+                    continue;
+                }
+                
+                // Verify with debounced read before processing
+                int debounced_state = read_toggle_state_debounced(sw->gpio_pin);
+                
+                // Only process if debounced state confirms the change
+                if (debounced_state != sw->last_state) {
+                    // State has changed and debounce passed - process it
+                    last_change_times[i] = now;
+                    sw->last_state = debounced_state;
+                    current_toggle_state = debounced_state;
+                } else {
+                    // False alarm, state didn't actually change
+                    continue;
+                }
+                
+                if (!wifi_connected) {
+                    ESP_LOGW(WIZ_TAG, "WiFi not connected, cannot control bulbs");
+                    led_status_blink(3, 100);
+                    continue;
+                }
+                
+                // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
+                bool new_bulb_state = (current_toggle_state == 1);
+                
+                ESP_LOGI(WIZ_TAG, "*** SWITCH %d CHANGED ***", i + 1);
+                ESP_LOGI(WIZ_TAG, "Switch %d (GPIO %d): %s (level: %d)", 
+                         i + 1, sw->gpio_pin, current_toggle_state == 1 ? "ON" : "OFF", current_toggle_state);
+                
+                // Control all bulbs for this switch
+                bool all_success = true;
+                for (int j = 0; j < sw->num_bulbs; j++) {
+                    ESP_LOGI(WIZ_TAG, "  Setting bulb %s to %s", sw->bulb_ips[j], new_bulb_state ? "ON" : "OFF");
+                    
+                    esp_err_t ret = wiz_set_state(sw->bulb_ips[j], new_bulb_state);
+                    if (ret == ESP_OK) {
+                        sw->bulb_states[j] = new_bulb_state;
+                    } else {
+                        ESP_LOGE(WIZ_TAG, "  Failed to control bulb %s", sw->bulb_ips[j]);
+                        all_success = false;
+                    }
+                }
+                
+                if (all_success) {
+                    ESP_LOGI(WIZ_TAG, "Switch %d: All bulbs updated successfully", i + 1);
+                    led_status_blink(1, 100); // Quick blink for feedback
+                } else {
+                    ESP_LOGE(WIZ_TAG, "Switch %d: Some bulbs failed to update", i + 1);
+                    led_status_blink(2, 200); // Error indication
+                }
             }
         }
         
         // Periodic sync check (every 2 seconds)
         if (wifi_connected && (now - last_sync_time >= pdMS_TO_TICKS(SYNC_INTERVAL_MS))) {
-            sync_bulb_with_toggle();
+            sync_all_switches();
             last_sync_time = now;
+        }
+        
+        // Debug logging every 5 seconds (show current GPIO states)
+        debug_counter++;
+        if (debug_counter >= 50) {  // 50 * 100ms = 5 seconds
+            ESP_LOGI(WIZ_TAG, "Debug - Current GPIO states:");
+            for (int i = 0; i < NUM_SWITCHES; i++) {
+                int raw_level = gpio_get_level(switches[i].gpio_pin);
+                ESP_LOGI(WIZ_TAG, "  Switch %d (GPIO %d): raw=%d, last_state=%d", 
+                         i + 1, switches[i].gpio_pin, raw_level, switches[i].last_state);
+            }
+            debug_counter = 0;
         }
         
         // Poll interval - check toggle state frequently
@@ -525,14 +629,8 @@ void app_main(void)
     ESP_LOGI(WIZ_TAG, "WiFi connected! Initializing UDP...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Test bulb communication
-    ESP_LOGI(WIZ_TAG, "");
-    ESP_LOGI(WIZ_TAG, "Testing bulb communication...");
-    wiz_discover_and_test(WIZ_BULB_IP);
-    ESP_LOGI(WIZ_TAG, "");
-    
     // Create toggle handler task FIRST (before initializing GPIO)
-    xTaskCreate(button_handler_task, "toggle_handler", 4096, NULL, 10, &button_task_handle);
+    xTaskCreate(button_handler_task, "toggle_handler", 8192, NULL, 10, &button_task_handle);
     vTaskDelay(pdMS_TO_TICKS(100)); // Give task time to start
     
     // Initialize toggle switch GPIO (after task is created)
@@ -540,8 +638,13 @@ void app_main(void)
     
     ESP_LOGI(WIZ_TAG, "========================================");
     ESP_LOGI(WIZ_TAG, "System ready!");
-    ESP_LOGI(WIZ_TAG, "Toggle switch on GPIO %d controls bulb", TOGGLE_GPIO);
-    ESP_LOGI(WIZ_TAG, "Bulb IP: %s", WIZ_BULB_IP);
+    ESP_LOGI(WIZ_TAG, "Configured %d switches controlling bulbs:", NUM_SWITCHES);
+    for (int i = 0; i < NUM_SWITCHES; i++) {
+        ESP_LOGI(WIZ_TAG, "  Switch %d (GPIO %d):", i + 1, switches[i].gpio_pin);
+        for (int j = 0; j < switches[i].num_bulbs; j++) {
+            ESP_LOGI(WIZ_TAG, "    -> Bulb %s", switches[i].bulb_ips[j]);
+        }
+    }
     ESP_LOGI(WIZ_TAG, "========================================");
     
     // Blink LED to indicate ready
