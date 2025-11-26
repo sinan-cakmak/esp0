@@ -35,6 +35,7 @@ typedef struct {
     int num_bulbs;
     bool last_state;
     bool bulb_states[MAX_BULBS_PER_SWITCH];
+    bool invert_logic;  // true = HIGH=ON LOW=OFF, false = LOW=ON HIGH=OFF
 } switch_config_t;
 
 static const char *TAG = "wifi";
@@ -45,13 +46,15 @@ static bool wifi_connected = false;
 static TaskHandle_t button_task_handle = NULL;
 static bool sync_in_progress = false;  // Prevent concurrent sync operations
 
-// Switch configurations - one switch controls bulbs 2&3 together
+// Switch configurations - Switch 1 controls bulbs 2&7 together
+// Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
+// Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true) - inverted logic
 static switch_config_t switches[NUM_SWITCHES] = {
-    {SWITCH_GPIO_1, {"192.168.1.2", "192.168.1.3"}, 2, -1, {false, false}},  // Switch 1: Bulbs 2 & 3
-    {SWITCH_GPIO_2, {"192.168.1.4"}, 1, -1, {false}},                        // Switch 2: Bulb 4
-    {SWITCH_GPIO_3, {"192.168.1.5"}, 1, -1, {false}},                        // Switch 3: Bulb 5
-    {SWITCH_GPIO_4, {"192.168.1.6"}, 1, -1, {false}},                        // Switch 4: Bulb 6
-    {SWITCH_GPIO_5, {"192.168.1.7"}, 1, -1, {false}}                         // Switch 5: Bulb 7
+    {SWITCH_GPIO_1, {"192.168.1.2", "192.168.1.7"}, 2, -1, {false, false}, false},  // Switch 1: Bulbs 2 & 7
+    {SWITCH_GPIO_2, {"192.168.1.4"}, 1, -1, {false}, true},                        // Switch 2: Bulb 4 (inverted)
+    {SWITCH_GPIO_3, {"192.168.1.5"}, 1, -1, {false}, true},                        // Switch 3: Bulb 5 (inverted)
+    {SWITCH_GPIO_4, {"192.168.1.6"}, 1, -1, {false}, true},                        // Switch 4: Bulb 6 (inverted)
+    {SWITCH_GPIO_5, {"192.168.1.3"}, 1, -1, {false}, true}                         // Switch 5: Bulb 3 (inverted)
 };
 
 // Forward declarations
@@ -327,9 +330,8 @@ static int read_toggle_state_debounced(int gpio_pin)
 /**
  * Initialize GPIO pins for all toggle switches
  * Toggle switches connected between GPIO pins and GND:
- * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb OFF (inverted)
- * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb ON (inverted)
- * Note: Logic is inverted because user reported toggle direction was wrong
+ * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb ON
+ * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb OFF
  */
 void toggle_gpio_init(void)
 {
@@ -368,8 +370,10 @@ void toggle_gpio_init(void)
         int level = read_toggle_state_debounced(switches[i].gpio_pin);
         switches[i].last_state = level;
         
-        // Set initial bulb state (inverted: HIGH = ON)
-        bool desired_state = (level == 1);
+        // Set initial bulb state based on switch's invert_logic setting
+        // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
+        // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
+        bool desired_state = switches[i].invert_logic ? (level == 1) : (level == 0);
         for (int j = 0; j < switches[i].num_bulbs; j++) {
             switches[i].bulb_states[j] = desired_state;
         }
@@ -382,7 +386,7 @@ void toggle_gpio_init(void)
     }
     
     ESP_LOGI(WIZ_TAG, "All %d toggle switches initialized", NUM_SWITCHES);
-    ESP_LOGI(WIZ_TAG, "Toggle ON (HIGH/1) = Bulb ON, Toggle OFF (LOW/0) = Bulb OFF");
+    ESP_LOGI(WIZ_TAG, "Toggle ON (LOW/0) = Bulb ON, Toggle OFF (HIGH/1) = Bulb OFF");
 }
 
 /**
@@ -423,8 +427,10 @@ static bool sync_switch_bulbs(int switch_idx)
     // Read toggle state with debouncing
     int toggle_state = read_toggle_state_debounced(sw->gpio_pin);
     
-    // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
-    bool desired_bulb_state = (toggle_state == 1);
+    // Apply logic based on switch's invert_logic setting
+    // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
+    // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
+    bool desired_bulb_state = sw->invert_logic ? (toggle_state == 1) : (toggle_state == 0);
     
     bool all_synced = true;
     
@@ -502,8 +508,6 @@ void button_handler_task(void *pvParameters)
     
     last_sync_time = xTaskGetTickCount();
     
-    uint32_t debug_counter = 0;
-    
     while (1) {
         uint32_t now = xTaskGetTickCount();
         
@@ -546,8 +550,10 @@ void button_handler_task(void *pvParameters)
                     continue;
                 }
                 
-                // INVERTED LOGIC: HIGH (1) = toggle ON = bulb ON, LOW (0) = toggle OFF = bulb OFF
-                bool new_bulb_state = (current_toggle_state == 1);
+                // Apply logic based on switch's invert_logic setting
+                // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
+                // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
+                bool new_bulb_state = sw->invert_logic ? (current_toggle_state == 1) : (current_toggle_state == 0);
                 
                 ESP_LOGI(WIZ_TAG, "*** SWITCH %d CHANGED ***", i + 1);
                 ESP_LOGI(WIZ_TAG, "Switch %d (GPIO %d): %s (level: %d)", 
@@ -581,18 +587,6 @@ void button_handler_task(void *pvParameters)
         if (wifi_connected && (now - last_sync_time >= pdMS_TO_TICKS(SYNC_INTERVAL_MS))) {
             sync_all_switches();
             last_sync_time = now;
-        }
-        
-        // Debug logging every 5 seconds (show current GPIO states)
-        debug_counter++;
-        if (debug_counter >= 50) {  // 50 * 100ms = 5 seconds
-            ESP_LOGI(WIZ_TAG, "Debug - Current GPIO states:");
-            for (int i = 0; i < NUM_SWITCHES; i++) {
-                int raw_level = gpio_get_level(switches[i].gpio_pin);
-                ESP_LOGI(WIZ_TAG, "  Switch %d (GPIO %d): raw=%d, last_state=%d", 
-                         i + 1, switches[i].gpio_pin, raw_level, switches[i].last_state);
-            }
-            debug_counter = 0;
         }
         
         // Poll interval - check toggle state frequently
