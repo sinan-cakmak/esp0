@@ -12,6 +12,7 @@
 #include "lwip/inet.h"
 #include "driver/gpio.h"
 #include "wifi_config.h"
+#include "cJSON.h"
 
 // WiZ Bulb Configuration
 #define WIZ_PORT       38899
@@ -31,7 +32,8 @@
 // Switch and Bulb Configuration Structure
 typedef struct {
     int gpio_pin;
-    const char* bulb_ips[MAX_BULBS_PER_SWITCH];
+    char bulb_ips[MAX_BULBS_PER_SWITCH][16];  // Mutable IP strings
+    const char* bulb_macs[MAX_BULBS_PER_SWITCH]; // MAC addresses for discovery
     int num_bulbs;
     bool last_state;
     bool bulb_states[MAX_BULBS_PER_SWITCH];
@@ -49,12 +51,13 @@ static bool sync_in_progress = false;  // Prevent concurrent sync operations
 // Switch configurations - Switch 1 controls bulbs 2&7 together
 // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
 // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true) - inverted logic
+// Note: IPs are discovered via MAC address at startup
 static switch_config_t switches[NUM_SWITCHES] = {
-    {SWITCH_GPIO_1, {"192.168.1.2", "192.168.1.7"}, 2, -1, {false, false}, false},  // Switch 1: Bulbs 2 & 7
-    {SWITCH_GPIO_2, {"192.168.1.4"}, 1, -1, {false}, true},                        // Switch 2: Bulb 4 (inverted)
-    {SWITCH_GPIO_3, {"192.168.1.5"}, 1, -1, {false}, true},                        // Switch 3: Bulb 5 (inverted)
-    {SWITCH_GPIO_4, {"192.168.1.6"}, 1, -1, {false}, true},                        // Switch 4: Bulb 6 (inverted)
-    {SWITCH_GPIO_5, {"192.168.1.3"}, 1, -1, {false}, true}                         // Switch 5: Bulb 3 (inverted)
+    {SWITCH_GPIO_1, {"", ""}, {"444f8e26e756","444f8e26e796"}, 2, -1, {false, false}, false},  // Switch 1: Bulbs 2 & 7 (MACs)
+    {SWITCH_GPIO_2, {""}, {"d8a01162bc9e"}, 1, -1, {false}, true},                               // Switch 2: Bulb 4 (MAC)
+    {SWITCH_GPIO_3, {""}, {"d8a01162ba16"}, 1, -1, {false}, true},                               // Switch 3: Bulb 5 (MAC)
+    {SWITCH_GPIO_4, {""}, {"444f8e308782"}, 1, -1, {false}, true},                               // Switch 4: Bulb 6 (MAC)
+    {SWITCH_GPIO_5, {""}, {"d8a01170b374"}, 1, -1, {false}, true}                                // Switch 5: Bulb 3 (MAC)
 };
 
 // Forward declarations
@@ -64,6 +67,7 @@ esp_err_t wiz_receive_response(char *buffer, size_t buffer_size);
 esp_err_t wiz_get_pilot(const char *bulb_ip, char *response_buffer, size_t buffer_size);
 esp_err_t wiz_set_state(const char *bulb_ip, bool on);
 esp_err_t wiz_discover_and_test(const char *bulb_ip);
+void wiz_discover_bulbs(void);
 void toggle_gpio_init(void);
 void led_status_init(void);
 void led_status_blink(uint32_t count, uint32_t delay_ms);
@@ -287,6 +291,90 @@ esp_err_t wiz_discover_and_test(const char *bulb_ip)
         ESP_LOGE(WIZ_TAG, "  3. ESP32 and bulb are on the same WiFi network");
         return ESP_FAIL;
     }
+}
+
+/**
+ * Discover WiZ bulbs on the network and update IPs based on MAC addresses
+ */
+void wiz_discover_bulbs(void)
+{
+    ESP_LOGI(WIZ_TAG, "Starting WiZ bulb discovery...");
+    
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(WIZ_TAG, "Failed to create discovery socket");
+        return;
+    }
+
+    // Enable broadcast
+    int broadcast = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
+        ESP_LOGE(WIZ_TAG, "Failed to enable broadcast");
+        close(sock);
+        return;
+    }
+
+    // Set receive timeout
+    struct timeval timeout;
+    timeout.tv_sec = 3;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Send discovery packet
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(WIZ_PORT);
+    dest_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+    const char *msg = "{\"method\":\"getPilot\",\"params\":{}}";
+    int err = sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0) {
+        ESP_LOGE(WIZ_TAG, "Failed to send discovery packet");
+        close(sock);
+        return;
+    }
+
+    // Listen for responses
+    char rx_buffer[1024];
+    struct sockaddr_in source_addr;
+    socklen_t socklen = sizeof(source_addr);
+    
+    uint32_t start_tick = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(3000)) {
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+        if (len > 0) {
+            rx_buffer[len] = 0;
+            
+            cJSON *root = cJSON_Parse(rx_buffer);
+            if (root) {
+                cJSON *result = cJSON_GetObjectItem(root, "result");
+                if (result) {
+                    cJSON *mac_item = cJSON_GetObjectItem(result, "mac");
+                    if (mac_item && cJSON_IsString(mac_item)) {
+                        const char *mac = mac_item->valuestring;
+                        char *ip_str = inet_ntoa(source_addr.sin_addr);
+                        
+                        // Check if this MAC matches any of our configured bulbs
+                        for (int i = 0; i < NUM_SWITCHES; i++) {
+                            for (int j = 0; j < switches[i].num_bulbs; j++) {
+                                if (switches[i].bulb_macs[j] && strcmp(mac, switches[i].bulb_macs[j]) == 0) {
+                                    ESP_LOGI(WIZ_TAG, "Found configured bulb! MAC: %s, IP: %s (Switch %d)", 
+                                             mac, ip_str, i + 1);
+                                    strncpy(switches[i].bulb_ips[j], ip_str, sizeof(switches[i].bulb_ips[j]) - 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                cJSON_Delete(root);
+            }
+        } else {
+            break; // Timeout or error
+        }
+    }
+
+    close(sock);
+    ESP_LOGI(WIZ_TAG, "Discovery complete");
 }
 
 // ========== Button GPIO Functions ==========
@@ -622,6 +710,9 @@ void app_main(void)
     
     ESP_LOGI(WIZ_TAG, "WiFi connected! Initializing UDP...");
     vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Discover bulbs on the network
+    wiz_discover_bulbs();
     
     // Create toggle handler task FIRST (before initializing GPIO)
     xTaskCreate(button_handler_task, "toggle_handler", 8192, NULL, 10, &button_task_handle);

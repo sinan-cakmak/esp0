@@ -5,7 +5,7 @@ An ESP32-based controller for managing multiple WiZ smart bulbs using physical t
 ## Quick Start
 
 1. **Configure WiFi**: Copy `main/wifi_config.h.example` to `main/wifi_config.h` and add your credentials
-2. **Update Bulb IPs**: Edit the `switches` array in `main/main.c` with your bulb IP addresses
+2. **Configure Bulbs**: Edit the `switches` array in `main/main.c` with your bulb MAC addresses. IP addresses are automatically discovered.
 3. **Wire Switches**: Follow the [Wiring Guide](WIRING.md) to connect 5 toggle switches
 4. **Build & Flash**: Use `idf.py build flash monitor` to build and flash the firmware
 
@@ -51,13 +51,13 @@ This project is a **Multi-Switch WiZ Smart Bulb Controller** for ESP32. It conne
 
 ### Switch Configuration
 
-| Switch # | GPIO Pin | Controls Bulbs (IP addresses) | Logic |
+| Switch # | GPIO Pin | Controls Bulbs (MAC addresses) | Logic |
 |----------|----------|-------------------------------|-------|
-| Switch 1 | GPIO 4   | 192.168.1.2, 192.168.1.7 (both together) | LOW=ON, HIGH=OFF |
-| Switch 2 | GPIO 5   | 192.168.1.4 | HIGH=ON, LOW=OFF |
-| Switch 3 | GPIO 18  | 192.168.1.5 | HIGH=ON, LOW=OFF |
-| Switch 4 | GPIO 19  | 192.168.1.6 | HIGH=ON, LOW=OFF |
-| Switch 5 | GPIO 21  | 192.168.1.3 | HIGH=ON, LOW=OFF |
+| Switch 1 | GPIO 4   | `d8a01162ba16`, `444f8e308782` | LOW=ON, HIGH=OFF |
+| Switch 2 | GPIO 5   | `d8a01162bc9e` | HIGH=ON, LOW=OFF |
+| Switch 3 | GPIO 18  | `d8a01170b374` | HIGH=ON, LOW=OFF |
+| Switch 4 | GPIO 19  | `444f8e26e796` | HIGH=ON, LOW=OFF |
+| Switch 5 | GPIO 21  | `444f8e26e756` | HIGH=ON, LOW=OFF |
 
 **Note**: Switch 1 uses different logic than switches 2-5 due to wiring differences. See [Wiring Guide](WIRING.md) for detailed connection instructions.
 
@@ -66,14 +66,15 @@ This project is a **Multi-Switch WiZ Smart Bulb Controller** for ESP32. It conne
 Before building, you need to configure:
 
 1. **WiFi Credentials**: See [WiFi Configuration Setup](#wifi-configuration-setup) above
-2. **Bulb IP Addresses**: Update the `switches` array in `main/main.c` (lines 52-57) with your bulb IP addresses
+2. **Bulb MAC Addresses**: Update the `switches` array in `main/main.c` (lines 52-57) with your bulb MAC addresses.
 
-To find your WiZ bulb IP addresses:
+**Auto-Discovery**:
+The system automatically discovers bulb IP addresses at startup using the configured MAC addresses. This ensures reliable operation even if bulb IP addresses change (DHCP).
 
-- Check your router's DHCP client list
+To find your WiZ bulb MAC addresses:
+- Check the bulb label
 - Use the WiZ app to view bulb details
-- Use a network scanner tool
-- Broadcast discovery: `192.168.1.255` (see code comments)
+- Use `wizlight discover` tool (Python)
 
 ### How It Works
 
