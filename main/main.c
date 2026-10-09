@@ -1,742 +1,419 @@
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "controller_config.h"
+#include "controller_logic.h"
+#include "wiz_protocol.h"
+
+#ifndef CONFIG_ESP0_INPUT_TEST_ONLY
+#include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_log.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
-#include "lwip/ip4_addr.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
-#include "driver/gpio.h"
 #include "wifi_config.h"
-#include "cJSON.h"
+#endif
 
-// WiZ Bulb Configuration
-#define WIZ_PORT       38899
-#define NUM_SWITCHES   5
-#define MAX_BULBS_PER_SWITCH 2
+static const char *TAG = "controller";
+static portMUX_TYPE input_lock = portMUX_INITIALIZER_UNLOCKED;
+static int stable_levels[NUM_SWITCHES];
+static bool input_valid[NUM_SWITCHES];
+static TaskHandle_t bulb_task_handle;
 
-// Toggle Switch GPIO Configuration - 5 switches
-#define SWITCH_GPIO_1    4   // Switch 1: GPIO 4
-#define SWITCH_GPIO_2    5   // Switch 2: GPIO 5
-#define SWITCH_GPIO_3    18  // Switch 3: GPIO 18
-#define SWITCH_GPIO_4    19  // Switch 4: GPIO 19
-#define SWITCH_GPIO_5    21  // Switch 5: GPIO 21
-
-// Status LED GPIO
-#define LED_STATUS_GPIO  2
-
-// Switch and Bulb Configuration Structure
-typedef struct {
-    int gpio_pin;
-    char bulb_ips[MAX_BULBS_PER_SWITCH][16];  // Mutable IP strings
-    const char* bulb_macs[MAX_BULBS_PER_SWITCH]; // MAC addresses for discovery
-    int num_bulbs;
-    bool last_state;
-    bool bulb_states[MAX_BULBS_PER_SWITCH];
-    bool invert_logic;  // true = HIGH=ON LOW=OFF, false = LOW=ON HIGH=OFF
-} switch_config_t;
-
-static const char *TAG = "wifi";
-static const char *WIZ_TAG = "wiz";
-
-static int udp_socket = -1;
-static bool wifi_connected = false;
-static TaskHandle_t button_task_handle = NULL;
-static bool sync_in_progress = false;  // Prevent concurrent sync operations
-
-// Switch configurations - Switch 1 controls bulbs 2&7 together
-// Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
-// Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true) - inverted logic
-// Note: IPs are discovered via MAC address at startup
-static switch_config_t switches[NUM_SWITCHES] = {
-    {SWITCH_GPIO_1, {"", ""}, {"444f8e26e756","444f8e26e796"}, 2, -1, {false, false}, false},  // Switch 1: Bulbs 2 & 7 (MACs)
-    {SWITCH_GPIO_2, {""}, {"d8a01162bc9e"}, 1, -1, {false}, true},                               // Switch 2: Bulb 4 (MAC)
-    {SWITCH_GPIO_3, {""}, {"d8a01162ba16"}, 1, -1, {false}, true},                               // Switch 3: Bulb 5 (MAC)
-    {SWITCH_GPIO_4, {""}, {"444f8e308782"}, 1, -1, {false}, true},                               // Switch 4: Bulb 6 (MAC)
-    {SWITCH_GPIO_5, {""}, {"d8a01170b374"}, 1, -1, {false}, true}                                // Switch 5: Bulb 3 (MAC)
-};
-
-// Forward declarations
-esp_err_t wiz_udp_init(void);
-esp_err_t wiz_send_command(const char *bulb_ip, const char *json_command);
-esp_err_t wiz_receive_response(char *buffer, size_t buffer_size);
-esp_err_t wiz_get_pilot(const char *bulb_ip, char *response_buffer, size_t buffer_size);
-esp_err_t wiz_set_state(const char *bulb_ip, bool on);
-esp_err_t wiz_discover_and_test(const char *bulb_ip);
-void wiz_discover_bulbs(void);
-void toggle_gpio_init(void);
-void led_status_init(void);
-void led_status_blink(uint32_t count, uint32_t delay_ms);
-
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data)
+#ifndef CONFIG_ESP0_INPUT_TEST_ONLY
+static bool desired_state(int index, bool *state)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } 
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG, "Disconnected, retrying...");
-        wifi_connected = false;
-        esp_wifi_connect();
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: %s", ip4addr_ntoa((ip4_addr_t*)&event->ip_info.ip));
-        wifi_connected = true;
-        // Initialize UDP socket for WiZ communication
-        wiz_udp_init();
+    portENTER_CRITICAL(&input_lock);
+    bool valid = input_valid[index];
+    int level = stable_levels[index];
+    portEXIT_CRITICAL(&input_lock);
+    *state = switch_desired_state(level, SWITCH_ASSIGNMENTS[index].on_when_high);
+    return valid;
+}
+#endif
+
+static void validate_configuration(void)
+{
+    for (int i = 0; i < NUM_SWITCHES; ++i) {
+        const switch_assignment_t *sw = &SWITCH_ASSIGNMENTS[i];
+        // Output-capable inputs have internal pull-ups on the classic ESP32.
+        ESP_ERROR_CHECK(GPIO_IS_VALID_OUTPUT_GPIO(sw->gpio_pin) &&
+                        sw->gpio_pin != LED_STATUS_GPIO &&
+                        sw->num_bulbs > 0 && sw->num_bulbs <= MAX_BULBS_PER_SWITCH
+                        ? ESP_OK : ESP_ERR_INVALID_ARG);
+        for (int j = 0; j < i; ++j) {
+            ESP_ERROR_CHECK(sw->gpio_pin != SWITCH_ASSIGNMENTS[j].gpio_pin
+                            ? ESP_OK : ESP_ERR_INVALID_ARG);
+        }
+        for (int b = 0; b < sw->num_bulbs; ++b) {
+            ESP_ERROR_CHECK(wiz_mac_equal(sw->bulb_macs[b], sw->bulb_macs[b])
+                            ? ESP_OK : ESP_ERR_INVALID_ARG);
+            for (int j = 0; j <= i; ++j) {
+                int limit = j == i ? b : SWITCH_ASSIGNMENTS[j].num_bulbs;
+                for (int k = 0; k < limit; ++k) {
+                    ESP_ERROR_CHECK(!wiz_mac_equal(sw->bulb_macs[b], SWITCH_ASSIGNMENTS[j].bulb_macs[k])
+                                    ? ESP_OK : ESP_ERR_INVALID_ARG);
+                }
+            }
+            ESP_LOGI(TAG, "Mapping: switch %d GPIO %d -> MAC %s (%s=ON)",
+                     i + 1, sw->gpio_pin, sw->bulb_macs[b], sw->on_when_high ? "HIGH" : "LOW");
+        }
     }
 }
 
-void wifi_init(void)
+static void gpio_init(void)
 {
-    ESP_ERROR_CHECK(nvs_flash_init());
+    uint64_t mask = 0;
+    for (int i = 0; i < NUM_SWITCHES; ++i) {
+        ESP_ERROR_CHECK(gpio_reset_pin(SWITCH_ASSIGNMENTS[i].gpio_pin));
+        mask |= 1ULL << SWITCH_ASSIGNMENTS[i].gpio_pin;
+    }
+    const gpio_config_t config = {
+        .pin_bit_mask = mask,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&config));
+    ESP_ERROR_CHECK(gpio_reset_pin(LED_STATUS_GPIO));
+    ESP_ERROR_CHECK(gpio_set_direction(LED_STATUS_GPIO, GPIO_MODE_OUTPUT));
+    ESP_ERROR_CHECK(gpio_set_level(LED_STATUS_GPIO, 0));
+}
+
+// Only this task samples switches. Network timeouts cannot interrupt debouncing.
+static void switch_task(void *arg)
+{
+    switch_debounce_t inputs[NUM_SWITCHES] = {0};
+    TickType_t next_sample = xTaskGetTickCount();
+#ifdef CONFIG_ESP0_INPUT_TEST_ONLY
+    int raw_previous[NUM_SWITCHES] = {-1, -1, -1, -1, -1};
+    TickType_t last_report = next_sample;
+#endif
+    while (true) {
+        uint32_t changed = 0;
+        TickType_t now = xTaskGetTickCount();
+        for (int i = 0; i < NUM_SWITCHES; ++i) {
+            int level = gpio_get_level(SWITCH_ASSIGNMENTS[i].gpio_pin);
+#ifdef CONFIG_ESP0_INPUT_TEST_ONLY
+            if (level != raw_previous[i]) {
+                ESP_LOGI(TAG, "RAW switch %d GPIO %d level=%d", i + 1, SWITCH_ASSIGNMENTS[i].gpio_pin, level);
+                raw_previous[i] = level;
+            }
+#endif
+            if (switch_debounce_sample(&inputs[i], level, now, pdMS_TO_TICKS(SWITCH_DEBOUNCE_MS))) {
+                portENTER_CRITICAL(&input_lock);
+                stable_levels[i] = inputs[i].stable;
+                input_valid[i] = true;
+                portEXIT_CRITICAL(&input_lock);
+                bool state = switch_desired_state(level, SWITCH_ASSIGNMENTS[i].on_when_high);
+                ESP_LOGI(TAG, "STABLE switch %d GPIO %d level=%d desired=%s", i + 1,
+                         SWITCH_ASSIGNMENTS[i].gpio_pin, level, state ? "ON" : "OFF");
+                changed |= 1UL << i;
+            }
+        }
+        if (changed && bulb_task_handle) {
+            xTaskNotify(bulb_task_handle, changed, eSetBits);
+        }
+#ifdef CONFIG_ESP0_INPUT_TEST_ONLY
+        if (now - last_report >= pdMS_TO_TICKS(5000)) {
+            ESP_LOGI(TAG, "INPUT snapshot levels=%d,%d,%d,%d,%d valid=%d,%d,%d,%d,%d",
+                     inputs[0].stable, inputs[1].stable, inputs[2].stable, inputs[3].stable, inputs[4].stable,
+                     inputs[0].valid, inputs[1].valid, inputs[2].valid, inputs[3].valid, inputs[4].valid);
+            last_report = now;
+        }
+#endif
+        vTaskDelayUntil(&next_sample, pdMS_TO_TICKS(SWITCH_SAMPLE_MS));
+    }
+}
+
+#ifndef CONFIG_ESP0_INPUT_TEST_ONLY
+#define WIFI_CONNECTED_BIT BIT0
+#define NETWORK_CHANGED_BIT BIT1
+#define RESPONSE_TIMEOUT_MS 600
+#define MAX_RETRIES 3
+
+static EventGroupHandle_t wifi_events;
+// Only the bulb task reads/writes addresses or uses UDP sockets.
+static char bulb_ips[NUM_SWITCHES][MAX_BULBS_PER_SWITCH][16];
+
+static bool wifi_connected(void)
+{
+    return (xEventGroupGetBits(wifi_events) & WIFI_CONNECTED_BIT) != 0;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        ESP_ERROR_CHECK(esp_wifi_connect());
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(wifi_events, NETWORK_CHANGED_BIT);
+        ESP_LOGW(TAG, "WiFi disconnected; reconnecting (switch sampling continues)");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = data;
+        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_events, WIFI_CONNECTED_BIT | NETWORK_CHANGED_BIT);
+    }
+}
+
+static void wifi_init(void)
+{
+    esp_err_t result = nvs_flash_init();
+    if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        result = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(result);
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    esp_netif_create_default_wifi_sta();
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-    
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-        },
-    };
-    
-    ESP_LOGI(TAG, "Connecting to %s...", WIFI_SSID);
-    
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_sta() ? ESP_OK : ESP_ERR_NO_MEM);
+    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&config));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
+    wifi_config_t credentials = {.sta = {.ssid = WIFI_SSID, .password = WIFI_PASSWORD}};
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &credentials));
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-// ========== WiZ Bulb UDP Communication Functions ==========
-
-/**
- * Initialize UDP socket for WiZ bulb communication
- */
-esp_err_t wiz_udp_init(void)
+static int udp_open(int timeout_ms, bool broadcast)
 {
-    if (udp_socket >= 0) {
-        close(udp_socket);
-    }
-
-    udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udp_socket < 0) {
-        ESP_LOGE(WIZ_TAG, "Failed to create UDP socket");
-        return ESP_FAIL;
-    }
-
-    // Set socket timeout
-    struct timeval timeout;
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
-    setsockopt(udp_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    ESP_LOGI(WIZ_TAG, "UDP socket initialized");
-    return ESP_OK;
-}
-
-/**
- * Send JSON command to WiZ bulb via UDP
- */
-esp_err_t wiz_send_command(const char *bulb_ip, const char *json_command)
-{
-    if (udp_socket < 0) {
-        ESP_LOGE(WIZ_TAG, "UDP socket not initialized");
-        return ESP_FAIL;
-    }
-
-    if (!wifi_connected) {
-        ESP_LOGE(WIZ_TAG, "WiFi not connected");
-        return ESP_FAIL;
-    }
-
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(bulb_ip);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(WIZ_PORT);
-
-    int len = strlen(json_command);
-    int err = sendto(udp_socket, json_command, len, 0,
-                     (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
-    if (err < 0) {
-        ESP_LOGE(WIZ_TAG, "Error occurred during sending: errno %d", errno);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGI(WIZ_TAG, "Sent to %s: %s", bulb_ip, json_command);
-    return ESP_OK;
-}
-
-/**
- * Receive response from WiZ bulb
- */
-esp_err_t wiz_receive_response(char *buffer, size_t buffer_size)
-{
-    if (udp_socket < 0) {
-        return ESP_FAIL;
-    }
-
-    struct sockaddr_in source_addr;
-    socklen_t socklen = sizeof(source_addr);
-    int len = recvfrom(udp_socket, buffer, buffer_size - 1, 0,
-                       (struct sockaddr *)&source_addr, &socklen);
-
-    if (len < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            ESP_LOGW(WIZ_TAG, "No response received (timeout)");
-        } else {
-            ESP_LOGE(WIZ_TAG, "recvfrom failed: errno %d", errno);
-        }
-        return ESP_FAIL;
-    }
-
-    buffer[len] = '\0';
-    ESP_LOGI(WIZ_TAG, "Received from %s: %s", inet_ntoa(source_addr.sin_addr), buffer);
-    return ESP_OK;
-}
-
-/**
- * Get current WiZ bulb state (discovery/test function)
- */
-esp_err_t wiz_get_pilot(const char *bulb_ip, char *response_buffer, size_t buffer_size)
-{
-    const char *json_cmd = "{\"method\":\"getPilot\",\"params\":{}}";
-    
-    esp_err_t ret = wiz_send_command(bulb_ip, json_cmd);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(200)); // Wait for response
-    return wiz_receive_response(response_buffer, buffer_size);
-}
-
-/**
- * Turn WiZ bulb on or off with retry logic
- */
-esp_err_t wiz_set_state(const char *bulb_ip, bool on)
-{
-    char json_cmd[128];
-    snprintf(json_cmd, sizeof(json_cmd),
-             "{\"method\":\"setPilot\",\"params\":{\"state\":%s}}",
-             on ? "true" : "false");
-    
-    const int MAX_RETRIES = 3;
-    const int RETRY_DELAY_MS = 200;
-    
-    for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        esp_err_t ret = wiz_send_command(bulb_ip, json_cmd);
-        if (ret == ESP_OK) {
-            if (attempt > 0) {
-                ESP_LOGW(WIZ_TAG, "Bulb command succeeded on attempt %d", attempt + 1);
-            }
-            return ESP_OK;
-        }
-        
-        if (attempt < MAX_RETRIES - 1) {
-            ESP_LOGW(WIZ_TAG, "Bulb command failed, retrying in %dms (attempt %d/%d)", 
-                     RETRY_DELAY_MS, attempt + 1, MAX_RETRIES);
-            vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
-        }
-    }
-    
-    ESP_LOGE(WIZ_TAG, "Failed to set bulb state after %d attempts", MAX_RETRIES);
-    return ESP_FAIL;
-}
-
-/**
- * Discover and test communication with WiZ bulb
- */
-esp_err_t wiz_discover_and_test(const char *bulb_ip)
-{
-    ESP_LOGI(WIZ_TAG, "========================================");
-    ESP_LOGI(WIZ_TAG, "Testing communication with bulb: %s", bulb_ip);
-    ESP_LOGI(WIZ_TAG, "========================================");
-    
-    char response[512];
-    esp_err_t ret = wiz_get_pilot(bulb_ip, response, sizeof(response));
-    
-    if (ret == ESP_OK) {
-        ESP_LOGI(WIZ_TAG, "SUCCESS! Bulb responded:");
-        ESP_LOGI(WIZ_TAG, "%s", response);
-        ESP_LOGI(WIZ_TAG, "Bulb is reachable and responding!");
-        return ESP_OK;
-    } else {
-        ESP_LOGE(WIZ_TAG, "FAILED! Could not communicate with bulb");
-        ESP_LOGE(WIZ_TAG, "Check:");
-        ESP_LOGE(WIZ_TAG, "  1. Bulb IP address is correct: %s", bulb_ip);
-        ESP_LOGE(WIZ_TAG, "  2. Bulb is powered on");
-        ESP_LOGE(WIZ_TAG, "  3. ESP32 and bulb are on the same WiFi network");
-        return ESP_FAIL;
-    }
-}
-
-/**
- * Discover WiZ bulbs on the network and update IPs based on MAC addresses
- */
-void wiz_discover_bulbs(void)
-{
-    ESP_LOGI(WIZ_TAG, "Starting WiZ bulb discovery...");
-    
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
-        ESP_LOGE(WIZ_TAG, "Failed to create discovery socket");
-        return;
+        return -1;
     }
-
-    // Enable broadcast
-    int broadcast = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
-        ESP_LOGE(WIZ_TAG, "Failed to enable broadcast");
+    struct timeval timeout = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
+    int enabled = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        (broadcast && setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &enabled, sizeof(enabled)) < 0)) {
         close(sock);
-        return;
+        return -1;
     }
+    return sock;
+}
 
-    // Set receive timeout
-    struct timeval timeout;
-    timeout.tv_sec = 3;
-    timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    // Send discovery packet
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(WIZ_PORT);
-    dest_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
-
-    const char *msg = "{\"method\":\"getPilot\",\"params\":{}}";
-    int err = sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err < 0) {
-        ESP_LOGE(WIZ_TAG, "Failed to send discovery packet");
-        close(sock);
-        return;
+// A fresh socket per request isolates late replies from earlier transactions.
+// Source IP/port and JSON method are validated; getPilot also validates the MAC.
+static bool wiz_request(const char *ip, const char *command, const char *mac, bool *state)
+{
+    struct sockaddr_in destination = {.sin_family = AF_INET, .sin_port = htons(WIZ_PORT)};
+    if (!wifi_connected() || inet_pton(AF_INET, ip, &destination.sin_addr) != 1 ||
+        destination.sin_addr.s_addr == INADDR_ANY || destination.sin_addr.s_addr == INADDR_BROADCAST ||
+        IN_MULTICAST(ntohl(destination.sin_addr.s_addr))) {
+        return false;
     }
-
-    // Listen for responses
-    char rx_buffer[1024];
-    struct sockaddr_in source_addr;
-    socklen_t socklen = sizeof(source_addr);
-    
-    uint32_t start_tick = xTaskGetTickCount();
-    while ((xTaskGetTickCount() - start_tick) < pdMS_TO_TICKS(3000)) {
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
-        if (len > 0) {
-            rx_buffer[len] = 0;
-            
-            cJSON *root = cJSON_Parse(rx_buffer);
-            if (root) {
-                cJSON *result = cJSON_GetObjectItem(root, "result");
-                if (result) {
-                    cJSON *mac_item = cJSON_GetObjectItem(result, "mac");
-                    if (mac_item && cJSON_IsString(mac_item)) {
-                        const char *mac = mac_item->valuestring;
-                        char *ip_str = inet_ntoa(source_addr.sin_addr);
-                        
-                        // Check if this MAC matches any of our configured bulbs
-                        for (int i = 0; i < NUM_SWITCHES; i++) {
-                            for (int j = 0; j < switches[i].num_bulbs; j++) {
-                                if (switches[i].bulb_macs[j] && strcmp(mac, switches[i].bulb_macs[j]) == 0) {
-                                    ESP_LOGI(WIZ_TAG, "Found configured bulb! MAC: %s, IP: %s (Switch %d)", 
-                                             mac, ip_str, i + 1);
-                                    strncpy(switches[i].bulb_ips[j], ip_str, sizeof(switches[i].bulb_ips[j]) - 1);
-                                }
-                            }
-                        }
-                    }
+    int sock = udp_open(100, false);
+    if (sock < 0) {
+        return false;
+    }
+    bool success = false;
+    size_t command_length = strlen(command);
+    if (sendto(sock, command, command_length, 0, (struct sockaddr *)&destination, sizeof(destination)) == (int)command_length) {
+        TickType_t start = xTaskGetTickCount();
+        while (wifi_connected() && xTaskGetTickCount() - start < pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS)) {
+            char response[1024];
+            struct sockaddr_in source;
+            socklen_t source_size = sizeof(source);
+            int length = recvfrom(sock, response, sizeof(response) - 1, 0, (struct sockaddr *)&source, &source_size);
+            if (length < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
                 }
-                cJSON_Delete(root);
+                break;
             }
-        } else {
-            break; // Timeout or error
+            if (length == 0 || source.sin_addr.s_addr != destination.sin_addr.s_addr || source.sin_port != htons(WIZ_PORT)) {
+                continue;
+            }
+            response[length] = '\0';
+            if (mac ? wiz_parse_pilot(response, mac, state) : wiz_parse_set_ack(response)) {
+                success = true;
+                break;
+            }
         }
     }
-
     close(sock);
-    ESP_LOGI(WIZ_TAG, "Discovery complete");
+    return success;
 }
 
-// ========== Button GPIO Functions ==========
-
-/**
- * IRAM_ATTR ISR handler for toggle switch interrupt
- * arg contains the switch index
- */
-static void IRAM_ATTR toggle_isr_handler(void* arg)
+static bool wiz_get_state(const char *ip, const char *mac, bool *state)
 {
-    if (button_task_handle == NULL) {
-        return; // Task not ready yet
-    }
-    
-    // Notify the toggle handler task (pass switch index in notification)
-    uint32_t switch_index = (uint32_t)arg;
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xTaskNotifyFromISR(button_task_handle, (1UL << switch_index), eSetBits, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    return wiz_request(ip, "{\"method\":\"getPilot\",\"params\":{}}", mac, state);
 }
 
-/**
- * Read toggle switch state with debouncing (multiple reads)
- */
-static int read_toggle_state_debounced(int gpio_pin)
+static void discover_bulbs(void)
 {
-    int readings[5];
-    int high_count = 0;
-    
-    // Take 5 readings with small delays
-    for (int i = 0; i < 5; i++) {
-        readings[i] = gpio_get_level(gpio_pin);
-        if (readings[i] == 1) high_count++;
-        vTaskDelay(pdMS_TO_TICKS(5));
+    memset(bulb_ips, 0, sizeof(bulb_ips));
+    int sock = udp_open(100, true);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Cannot create discovery socket");
+        return;
     }
-    
-    // Return majority state (HIGH if 3+ readings are HIGH)
-    return (high_count >= 3) ? 1 : 0;
-}
-
-/**
- * Initialize GPIO pins for all toggle switches
- * Toggle switches connected between GPIO pins and GND:
- * - When switch is ON (closed): GPIO reads LOW (0) -> Bulb ON
- * - When switch is OFF (open): GPIO reads HIGH (1) -> Bulb OFF
- */
-void toggle_gpio_init(void)
-{
-    // Build pin mask for all switches
-    uint64_t pin_mask = 0;
-    
-    // Reset all pins FIRST (before configuration)
-    for (int i = 0; i < NUM_SWITCHES; i++) {
-        gpio_reset_pin(switches[i].gpio_pin);
-        pin_mask |= (1ULL << switches[i].gpio_pin);
-    }
-    
-    // Configure all switch GPIOs at once (AFTER reset)
-    gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_ANYEDGE,  // Interrupt on both edges (toggle position change)
-        .mode = GPIO_MODE_INPUT,
-        .pin_bit_mask = pin_mask,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .pull_up_en = GPIO_PULLUP_ENABLE,  // Pull-up so open switch reads HIGH
+    ESP_LOGI(TAG, "Discovering configured bulbs by MAC...");
+    const char *command = "{\"method\":\"getPilot\",\"params\":{}}";
+    const struct sockaddr_in destination = {
+        .sin_family = AF_INET, .sin_port = htons(WIZ_PORT), .sin_addr.s_addr = INADDR_BROADCAST,
     };
-    gpio_config(&io_conf);
-
-    // Install ISR service if not already installed
-    static bool isr_service_installed = false;
-    if (!isr_service_installed) {
-        gpio_install_isr_service(0);
-        isr_service_installed = true;
-    }
-    
-    // Add ISR handler for each switch (pass switch index as argument)
-    // NOTE: Do NOT call gpio_reset_pin() here - it would clear the config!
-    for (int i = 0; i < NUM_SWITCHES; i++) {
-        gpio_isr_handler_add(switches[i].gpio_pin, toggle_isr_handler, (void*)i);
-        
-        // Read initial state with debouncing
-        int level = read_toggle_state_debounced(switches[i].gpio_pin);
-        switches[i].last_state = level;
-        
-        // Set initial bulb state based on switch's invert_logic setting
-        // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
-        // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
-        bool desired_state = switches[i].invert_logic ? (level == 1) : (level == 0);
-        for (int j = 0; j < switches[i].num_bulbs; j++) {
-            switches[i].bulb_states[j] = desired_state;
-        }
-        
-        ESP_LOGI(WIZ_TAG, "Switch %d (GPIO %d) initialized, level: %d, bulbs: %d", 
-                 i + 1, switches[i].gpio_pin, level, switches[i].num_bulbs);
-        for (int j = 0; j < switches[i].num_bulbs; j++) {
-            ESP_LOGI(WIZ_TAG, "  -> Bulb %d: %s", j + 1, switches[i].bulb_ips[j]);
-        }
-    }
-    
-    ESP_LOGI(WIZ_TAG, "All %d toggle switches initialized", NUM_SWITCHES);
-    ESP_LOGI(WIZ_TAG, "Toggle ON (LOW/0) = Bulb ON, Toggle OFF (HIGH/1) = Bulb OFF");
-}
-
-/**
- * Initialize status LED GPIO
- */
-void led_status_init(void)
-{
-    gpio_reset_pin(LED_STATUS_GPIO);
-    gpio_set_direction(LED_STATUS_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_STATUS_GPIO, 0);
-    ESP_LOGI(WIZ_TAG, "Status LED initialized on GPIO %d", LED_STATUS_GPIO);
-}
-
-/**
- * Blink status LED
- */
-void led_status_blink(uint32_t count, uint32_t delay_ms)
-{
-    for (uint32_t i = 0; i < count; i++) {
-        gpio_set_level(LED_STATUS_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        gpio_set_level(LED_STATUS_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-    }
-}
-
-/**
- * Sync bulbs for a specific switch with its toggle state
- */
-static bool sync_switch_bulbs(int switch_idx)
-{
-    if (switch_idx < 0 || switch_idx >= NUM_SWITCHES || !wifi_connected) {
-        return false;
-    }
-    
-    switch_config_t* sw = &switches[switch_idx];
-    
-    // Read toggle state with debouncing
-    int toggle_state = read_toggle_state_debounced(sw->gpio_pin);
-    
-    // Apply logic based on switch's invert_logic setting
-    // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
-    // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
-    bool desired_bulb_state = sw->invert_logic ? (toggle_state == 1) : (toggle_state == 0);
-    
-    bool all_synced = true;
-    
-    // Sync all bulbs for this switch
-    for (int i = 0; i < sw->num_bulbs; i++) {
-        if (sw->bulb_states[i] != desired_bulb_state) {
-            ESP_LOGI(WIZ_TAG, "Syncing Switch %d: Toggle=%d (bulb=%s), Bulb %s current=%s", 
-                     switch_idx + 1, toggle_state, desired_bulb_state ? "ON" : "OFF",
-                     sw->bulb_ips[i], sw->bulb_states[i] ? "ON" : "OFF");
-            
-            esp_err_t ret = wiz_set_state(sw->bulb_ips[i], desired_bulb_state);
-            if (ret == ESP_OK) {
-                sw->bulb_states[i] = desired_bulb_state;
-            } else {
-                all_synced = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t last_send = start;
+    bool first = true;
+    while (wifi_connected() && xTaskGetTickCount() - start < pdMS_TO_TICKS(3000)) {
+        TickType_t now = xTaskGetTickCount();
+        if (first || now - last_send >= pdMS_TO_TICKS(1000)) {
+            if (sendto(sock, command, strlen(command), 0, (const struct sockaddr *)&destination, sizeof(destination)) < 0) {
+                ESP_LOGW(TAG, "Discovery broadcast failed: errno %d", errno);
             }
+            first = false;
+            last_send = now;
         }
-    }
-    
-    return all_synced;
-}
-
-/**
- * Sync all switches with their bulbs
- */
-static bool sync_all_switches(void)
-{
-    if (sync_in_progress || !wifi_connected) {
-        return false;
-    }
-    
-    sync_in_progress = true;
-    bool all_ok = true;
-    
-    for (int i = 0; i < NUM_SWITCHES; i++) {
-        if (!sync_switch_bulbs(i)) {
-            all_ok = false;
+        char response[1024];
+        struct sockaddr_in source;
+        socklen_t source_size = sizeof(source);
+        int length = recvfrom(sock, response, sizeof(response) - 1, 0, (struct sockaddr *)&source, &source_size);
+        if (length < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            break;
         }
-    }
-    
-    sync_in_progress = false;
-    return all_ok;
-}
-
-/**
- * Toggle switch handler task - processes toggle position changes for all switches
- * Uses polling as primary method with interrupts as fast path
- */
-void button_handler_task(void *pvParameters)
-{
-    uint32_t notification_value;
-    uint32_t last_change_times[NUM_SWITCHES] = {0};
-    const uint32_t DEBOUNCE_MS = 50;  // Debounce time
-    const uint32_t POLL_INTERVAL_MS = 100;  // Poll every 100ms to catch missed interrupts
-    const uint32_t SYNC_INTERVAL_MS = 2000;  // Full sync every 2 seconds
-    uint32_t last_sync_time = 0;
-    
-    ESP_LOGI(WIZ_TAG, "Toggle switch handler task started for %d switches", NUM_SWITCHES);
-    
-    // Wait for WiFi before reading initial state
-    int wifi_wait = 0;
-    while (!wifi_connected && wifi_wait < 30) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        wifi_wait++;
-    }
-    
-    if (!wifi_connected) {
-        ESP_LOGW(WIZ_TAG, "WiFi not connected, toggle handler will wait");
-    }
-    
-    // Sync initial state for all switches
-    if (wifi_connected) {
-        sync_all_switches();
-    }
-    
-    last_sync_time = xTaskGetTickCount();
-    
-    while (1) {
-        uint32_t now = xTaskGetTickCount();
-        
-        // Check for interrupt notifications (fast path) - non-blocking check
-        // Note: We use polling as primary method, interrupts are just optimization
-        xTaskNotifyWait(0x00, ULONG_MAX, &notification_value, 0);
-        
-        // Process each switch
-        for (int i = 0; i < NUM_SWITCHES; i++) {
-            switch_config_t* sw = &switches[i];
-            
-            // Read GPIO state directly (fast, single read for change detection)
-            int current_toggle_state = gpio_get_level(sw->gpio_pin);
-            
-            // Check if state changed
-            if (current_toggle_state != sw->last_state) {
-                // Debounce check
-                if (now - last_change_times[i] < pdMS_TO_TICKS(DEBOUNCE_MS)) {
-                    // Too soon after last change - might be noise, skip this switch
-                    continue;
-                }
-                
-                // Verify with debounced read before processing
-                int debounced_state = read_toggle_state_debounced(sw->gpio_pin);
-                
-                // Only process if debounced state confirms the change
-                if (debounced_state != sw->last_state) {
-                    // State has changed and debounce passed - process it
-                    last_change_times[i] = now;
-                    sw->last_state = debounced_state;
-                    current_toggle_state = debounced_state;
-                } else {
-                    // False alarm, state didn't actually change
-                    continue;
-                }
-                
-                if (!wifi_connected) {
-                    ESP_LOGW(WIZ_TAG, "WiFi not connected, cannot control bulbs");
-                    led_status_blink(3, 100);
-                    continue;
-                }
-                
-                // Apply logic based on switch's invert_logic setting
-                // Switch 1: LOW=ON HIGH=OFF (invert_logic=false)
-                // Switches 2-5: HIGH=ON LOW=OFF (invert_logic=true)
-                bool new_bulb_state = sw->invert_logic ? (current_toggle_state == 1) : (current_toggle_state == 0);
-                
-                ESP_LOGI(WIZ_TAG, "*** SWITCH %d CHANGED ***", i + 1);
-                ESP_LOGI(WIZ_TAG, "Switch %d (GPIO %d): %s (level: %d)", 
-                         i + 1, sw->gpio_pin, current_toggle_state == 1 ? "ON" : "OFF", current_toggle_state);
-                
-                // Control all bulbs for this switch
-                bool all_success = true;
-                for (int j = 0; j < sw->num_bulbs; j++) {
-                    ESP_LOGI(WIZ_TAG, "  Setting bulb %s to %s", sw->bulb_ips[j], new_bulb_state ? "ON" : "OFF");
-                    
-                    esp_err_t ret = wiz_set_state(sw->bulb_ips[j], new_bulb_state);
-                    if (ret == ESP_OK) {
-                        sw->bulb_states[j] = new_bulb_state;
-                    } else {
-                        ESP_LOGE(WIZ_TAG, "  Failed to control bulb %s", sw->bulb_ips[j]);
-                        all_success = false;
+        if (!length || source.sin_port != htons(WIZ_PORT)) {
+            continue;
+        }
+        response[length] = '\0';
+        for (int i = 0; i < NUM_SWITCHES; ++i) {
+            for (int b = 0; b < SWITCH_ASSIGNMENTS[i].num_bulbs; ++b) {
+                bool state;
+                if (wiz_parse_pilot(response, SWITCH_ASSIGNMENTS[i].bulb_macs[b], &state)) {
+                    char address[16];
+                    if (inet_ntop(AF_INET, &source.sin_addr, address, sizeof(address)) && strcmp(bulb_ips[i][b], address) != 0) {
+                        snprintf(bulb_ips[i][b], sizeof(bulb_ips[i][b]), "%s", address);
+                        ESP_LOGI(TAG, "Found switch %d MAC %s at %s", i + 1, SWITCH_ASSIGNMENTS[i].bulb_macs[b], address);
                     }
                 }
-                
-                if (all_success) {
-                    ESP_LOGI(WIZ_TAG, "Switch %d: All bulbs updated successfully", i + 1);
-                    led_status_blink(1, 100); // Quick blink for feedback
-                } else {
-                    ESP_LOGE(WIZ_TAG, "Switch %d: Some bulbs failed to update", i + 1);
-                    led_status_blink(2, 200); // Error indication
+            }
+        }
+    }
+    close(sock);
+    for (int i = 0; i < NUM_SWITCHES; ++i) {
+        for (int b = 0; b < SWITCH_ASSIGNMENTS[i].num_bulbs; ++b) {
+            if (!bulb_ips[i][b][0]) {
+                ESP_LOGW(TAG, "Missing switch %d MAC %s; no command will be sent to it", i + 1, SWITCH_ASSIGNMENTS[i].bulb_macs[b]);
+            }
+        }
+    }
+}
+
+static bool sync_bulb(int switch_index, int bulb_index)
+{
+    const char *ip = bulb_ips[switch_index][bulb_index];
+    const char *mac = SWITCH_ASSIGNMENTS[switch_index].bulb_macs[bulb_index];
+    if (!ip[0]) {
+        return false;
+    }
+    for (int attempt = 0; attempt < MAX_RETRIES && wifi_connected(); ++attempt) {
+        bool actual, desired;
+        // Check identity before writing, in case DHCP has assigned this IP to another device.
+        if (wiz_get_state(ip, mac, &actual) && desired_state(switch_index, &desired)) {
+            if (actual == desired) {
+                return true;
+            }
+            char command[96];
+            snprintf(command, sizeof(command), "{\"method\":\"setPilot\",\"params\":{\"state\":%s}}", desired ? "true" : "false");
+            ESP_LOGI(TAG, "Setting switch %d MAC %s -> %s", switch_index + 1, mac, desired ? "ON" : "OFF");
+            bool acknowledged = wiz_request(ip, command, NULL, NULL);
+            // Read back even if the acknowledgement was lost. Never cache an assumed state.
+            if (wiz_get_state(ip, mac, &actual) && actual == desired) {
+                bool latest;
+                if (desired_state(switch_index, &latest) && latest == desired) {
+                    ESP_LOGI(TAG, "Confirmed MAC %s %s%s", mac, desired ? "ON" : "OFF", acknowledged ? "" : " (ack lost; read-back succeeded)");
+                    return true;
                 }
             }
         }
-        
-        // Periodic sync check (every 2 seconds)
-        if (wifi_connected && (now - last_sync_time >= pdMS_TO_TICKS(SYNC_INTERVAL_MS))) {
-            sync_all_switches();
-            last_sync_time = now;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    ESP_LOGW(TAG, "Unconfirmed switch %d MAC %s; will rediscover and retry", switch_index + 1, mac);
+    bulb_ips[switch_index][bulb_index][0] = '\0';
+    return false;
+}
+
+static void bulb_task(void *arg)
+{
+    bool network_ready = false;
+    bool discovery_needed = true;
+    TickType_t last_discovery = 0;
+    TickType_t last_sync = 0;
+    const uint32_t all_switches = (1UL << NUM_SWITCHES) - 1;
+    while (true) {
+        EventBits_t events = xEventGroupWaitBits(wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(1000));
+        if (!(events & WIFI_CONNECTED_BIT)) {
+            gpio_set_level(LED_STATUS_GPIO, 0);
+            network_ready = false;
+            continue;
         }
-        
-        // Poll interval - check toggle state frequently
-        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+        bool refresh = !network_ready || (events & NETWORK_CHANGED_BIT);
+        if (refresh) {
+            xEventGroupClearBits(wifi_events, NETWORK_CHANGED_BIT);
+        }
+        bool discovered = refresh || (discovery_needed && xTaskGetTickCount() - last_discovery >= pdMS_TO_TICKS(BULB_DISCOVERY_MS));
+        if (discovered) {
+            discover_bulbs();
+            last_discovery = xTaskGetTickCount();
+            network_ready = true;
+        }
+        uint32_t changed = 0;
+        xTaskNotifyWait(0, UINT32_MAX, &changed, pdMS_TO_TICKS(100));
+        TickType_t now = xTaskGetTickCount();
+        bool full_sync = discovered || now - last_sync >= pdMS_TO_TICKS(BULB_SYNC_MS);
+        uint32_t selected = full_sync ? all_switches : changed;
+        if (selected) {
+            bool all_ok = true;
+            for (int i = 0; i < NUM_SWITCHES; ++i) {
+                if (!(selected & (1UL << i))) {
+                    continue;
+                }
+                for (int b = 0; b < SWITCH_ASSIGNMENTS[i].num_bulbs; ++b) {
+                    if (!sync_bulb(i, b)) {
+                        all_ok = false;
+                        discovery_needed = true;
+                    }
+                }
+            }
+            if (full_sync) {
+                last_sync = xTaskGetTickCount();
+                discovery_needed = !all_ok;
+                gpio_set_level(LED_STATUS_GPIO, all_ok);
+            } else if (!all_ok) {
+                gpio_set_level(LED_STATUS_GPIO, 0);
+            }
+        }
     }
 }
+#endif
 
 void app_main(void)
 {
-    ESP_LOGI(WIZ_TAG, "========================================");
-    ESP_LOGI(WIZ_TAG, "WiZ Bulb Controller - Simple Version");
-    ESP_LOGI(WIZ_TAG, "========================================");
-    
-    // Initialize WiFi
+    ESP_LOGI(TAG, "WiZ five-switch controller");
+    validate_configuration();
+    gpio_init();
+#ifdef CONFIG_ESP0_INPUT_TEST_ONLY
+    ESP_LOGW(TAG, "INPUT TEST ONLY: WiFi disabled, no bulb commands");
+#else
+    wifi_events = xEventGroupCreate();
+    ESP_ERROR_CHECK(wifi_events ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(bulb_task, "bulbs", 8192, NULL, 5, &bulb_task_handle) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#endif
+    ESP_ERROR_CHECK(xTaskCreate(switch_task, "switches", 4096, NULL, 10, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#ifndef CONFIG_ESP0_INPUT_TEST_ONLY
     wifi_init();
-    
-    // Initialize status LED
-    led_status_init();
-    
-    // Wait for WiFi connection
-    ESP_LOGI(WIZ_TAG, "Waiting for WiFi connection...");
-    int wait_count = 0;
-    while (!wifi_connected && wait_count < 30) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        wait_count++;
-    }
-    
-    if (!wifi_connected) {
-        ESP_LOGE(WIZ_TAG, "WiFi connection timeout!");
-        led_status_blink(5, 200);
-        return;
-    }
-    
-    ESP_LOGI(WIZ_TAG, "WiFi connected! Initializing UDP...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    
-    // Discover bulbs on the network
-    wiz_discover_bulbs();
-    
-    // Create toggle handler task FIRST (before initializing GPIO)
-    xTaskCreate(button_handler_task, "toggle_handler", 8192, NULL, 10, &button_task_handle);
-    vTaskDelay(pdMS_TO_TICKS(100)); // Give task time to start
-    
-    // Initialize toggle switch GPIO (after task is created)
-    toggle_gpio_init();
-    
-    ESP_LOGI(WIZ_TAG, "========================================");
-    ESP_LOGI(WIZ_TAG, "System ready!");
-    ESP_LOGI(WIZ_TAG, "Configured %d switches controlling bulbs:", NUM_SWITCHES);
-    for (int i = 0; i < NUM_SWITCHES; i++) {
-        ESP_LOGI(WIZ_TAG, "  Switch %d (GPIO %d):", i + 1, switches[i].gpio_pin);
-        for (int j = 0; j < switches[i].num_bulbs; j++) {
-            ESP_LOGI(WIZ_TAG, "    -> Bulb %s", switches[i].bulb_ips[j]);
-        }
-    }
-    ESP_LOGI(WIZ_TAG, "========================================");
-    
-    // Blink LED to indicate ready
-    led_status_blink(2, 200);
-    
-    // Main loop - keep task alive
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+#endif
 }

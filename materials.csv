@@ -1,0 +1,51 @@
+material_name,quantity,unit_price,reported_total,quantity_times_unit_price,totals_match
+Soldex 0.5 mm 200 g Lehim Teli (%60 Sn / %40 Pb),1,840,840,840,TRUE
+Sunline 926 Isı Kontrollü Havya,1,827.27,827.27,827.27,TRUE
+Kesme Matı A2,1,659.4,659.4,659.4,TRUE
+Mestek DM-90E Dijital Multimetre,1,603.84,603.84,603.84,TRUE
+ESP32 ESP-32S WiFi + Bluetooth Dual-Mode Geliştirme Kartı (38 Pin),2,233.33,466.65,466.66,FALSE
+"Proskit İnce, Uzun Metal Cımbız 1PK-123T",1,279.35,279.35,279.35,TRUE
+IC150 4 Ayaklı Orta Boy Toggle Anahtar,5,40.89,204.47,204.45,FALSE
+Toprak Nemi Algılama Sensörü,5,38.34,191.69,191.7,FALSE
+IC152 3 Ayaklı Büyük Boy Toggle Anahtar On-On,5,37.83,189.13,189.15,FALSE
+Felder Löttechnik Lehim Pastası 50g,1,161.02,161.02,161.02,TRUE
+LDR Işık Sensörü Kartı (3 Pin),5,29.65,148.24,148.25,FALSE
+14mm 4'lü 7-Segment Anot Display - Kırmızı,2,48.56,97.12,97.12,TRUE
+Mini Dalgıç Su Pompası 6V 120 Litre/Saat,2,47.54,95.08,95.08,TRUE
+DS3231 Hassas RTC ve 24C32 EEPROM Modülü,1,86.9,86.9,86.9,TRUE
+14 mm 7 Segment Display - Katot,5,12.27,61.34,61.35,FALSE
+3x7 cm Çift Yüzlü Pertinaks,5,10.22,51.12,51.1,FALSE
+40 Pin Ayrılabilen Erkek-Erkek M-M Jumper Kablo-200 mm,1,48.56,48.56,48.56,TRUE
+1 Kanal 5 V Röle Kartı - Low Level Trigger,1,48.56,48.56,48.56,TRUE
+220 nF 63V Polyester Kondansatör Paketi - 5 Adet,2,23,46,46,TRUE
+40 Pin Ayrılabilen Dişi-Erkek M-F Jumper Kablo-200 mm,1,46,46,46,TRUE
+4x4 Push Buton Keypad,1,45.49,45.49,45.49,TRUE
+AMS1117 5 V Gerilim Regülatör Kartı,2,21.98,43.96,43.96,TRUE
+Büyük Boy Breadboard,1,43.45,43.45,43.45,TRUE
+40 Pin Ayrılabilen Dişi-Dişi F-F Jumper Kablo-200 mm,1,38.34,38.34,38.34,TRUE
+TS-11 Cımbız,1,37.72,37.72,37.72,TRUE
+4 Pinli Push Buton - Siyah (12x12x1 mm),5,6.65,33.23,33.25,FALSE
+TP4056 Mikro USB 3.7 V 1S Lipo Şarj Aleti,2,14.31,28.63,28.62,FALSE
+IRFZ44N - 49 A 55 V MOSFET - TO220 Mosfet,2,13.29,26.58,26.58,TRUE
+100 uF 25 V Kondansatör,10,2.56,25.56,25.6,FALSE
+Orta Boy Breadboard,1,25.56,25.56,25.56,TRUE
+10 uF 25 V Kondansatör,15,1.53,23,22.95,FALSE
+47 uF 25 V Kondansatör,10,2.04,20.45,20.4,FALSE
+Mavi Mini Breadboard,1,15.33,15.33,15.33,TRUE
+BC547 - TO92 Transistör,10,1.53,15.33,15.3,FALSE
+1 uF 50 V Kondansatör,10,1.53,15.33,15.3,FALSE
+WS2812 5 mm RGB LED,1,14.31,14.31,14.31,TRUE
+22 uF 50 V Kondansatör,5,2.04,10.22,10.2,FALSE
+5 mm Kırmızı Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+5 mm Yeşil Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+5 mm Sarı Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+3 mm Şeffaf Beyaz Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+5 mm Şeffaf Beyaz Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+5 mm Mavi Led Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+1N4007 - 1000 V 1 A Aksiyel Tipli Diyot Paketi - 10 Adet,1,9.2,9.2,9.2,TRUE
+1N4148 - 100 V 450 mA Aksiyel Tipli Hızlı Diyot - 10 adet,1,5.62,5.62,5.62,TRUE
+1/4 W 330 R Direnç Paketi - 10 Adet,1,2.04,2.04,2.04,TRUE
+1/4 W 220 R Direnç Paketi - 10 Adet,1,2.04,2.04,2.04,TRUE
+1/4 W 10K Direnç Paketi - 10 Adet,1,2.04,2.04,2.04,TRUE
+1/4 W 100K Direnç Paketi - 10 Adet,1,2.04,2.04,2.04,TRUE
+1/4 W 4.7K Direnç Paketi - 10 Adet,1,2.04,2.04,2.04,TRUE

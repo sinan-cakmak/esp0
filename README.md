@@ -1,158 +1,75 @@
-# Multi-Switch WiZ Bulb Controller
+# Five-switch WiZ bulb controller
 
-An ESP32-based controller for managing multiple WiZ smart bulbs using physical toggle switches. This project provides reliable, local control of up to 6 WiZ bulbs through 5 toggle switches, with automatic retry logic and periodic synchronization.
+An ESP32 controller for six living-room WiZ bulbs using five maintained toggle switches. Switch 1 controls a pair; switches 2–5 control one bulb each. This is a learning prototype being checked before permanent assembly.
 
-## Quick Start
+See [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for confirmed hardware, review findings, and test progress, and [WIRING.md](WIRING.md) before changing connections.
 
-1. **Configure WiFi**: Copy `main/wifi_config.h.example` to `main/wifi_config.h` and add your credentials
-2. **Configure Bulbs**: Edit the `switches` array in `main/main.c` with your bulb MAC addresses. IP addresses are automatically discovered.
-3. **Wire Switches**: Follow the [Wiring Guide](WIRING.md) to connect 5 toggle switches
-4. **Build & Flash**: Use `idf.py build flash monitor` to build and flash the firmware
+## Configuration
 
-## WiFi Configuration Setup
+- WiFi: copy `main/wifi_config.h.example` to `main/wifi_config.h` and fill in credentials. This file is ignored by Git; do not share it.
+- GPIO, bulb MAC addresses, and switch direction: `main/controller_config.h`.
+- Bulb IP addresses are discovered by MAC, not hard-coded. Discovery runs at connection/reconnection, and retries every 30 seconds while bulbs are missing or unconfirmed.
+- Intended room labels and physical lever directions still need verification.
 
-**IMPORTANT**: Before building, you must configure your WiFi credentials:
+Current assignments, preserved from the old firmware:
 
-1. Copy the template file to create your WiFi configuration:
+| Switch | GPIO | Bulb MAC addresses | Bulb ON when input is |
+| --- | --- | --- | --- |
+| 1 | 4 | `444f8e26e756`, `444f8e26e796` | LOW (contacts closed to GND) |
+| 2 | 5 | `d8a01162bc9e` | HIGH (contacts open) |
+| 3 | 18 | `d8a01162ba16` | HIGH (contacts open) |
+| 4 | 19 | `444f8e308782` | HIGH (contacts open) |
+| 5 | 21 | `d8a01170b374` | HIGH (contacts open) |
 
-   ```bash
-   cp main/wifi_config.h.example main/wifi_config.h
-   ```
+The mixed direction is inherited configuration, not a requirement. Do not assume that a physical lever marked ON corresponds to these electrical states.
 
-2. Edit `main/wifi_config.h` and replace the placeholders with your actual WiFi credentials:
-   ```c
-   #define WIFI_SSID      "YOUR_WIFI_SSID_HERE"
-   #define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD_HERE"
-   ```
+## First powered test: inputs only
 
-The `wifi_config.h` file is gitignored and will not be committed to the repository, keeping your credentials secure.
+1. Activate a working ESP-IDF 5.5.1 environment.
+2. Run `idf.py menuconfig`. Under **WiZ controller**, enable **Switch input test only (no WiFi or bulb commands)**.
+3. Build and flash: `idf.py -p /dev/cu.usbserial-0001 build flash monitor`. Check the port if it changes.
+4. Confirm the message `INPUT TEST ONLY: WiFi disabled, no bulb commands`.
+5. Leave all switches untouched for 30 seconds: there should be no new `RAW` or `STABLE` changes after initial settling.
+6. Move one switch at a time, waiting one second between movements. Only that switch's `STABLE` input should change. Repeat each switch ten times.
+7. If another switch changes, or a stationary switch changes, stop and inspect the contact pairs, independent signal wires, and shared ground. Short bursts of `RAW` changes on the moved switch may be normal contact bounce; the stable result should settle once.
+8. Exit the monitor with Ctrl+]. Record results in `PROJECT_CONTEXT.md`.
 
-## Project Overview
+This mode does not need WiFi credentials and does not initialize WiFi or send bulb commands. Snapshot levels are ordered switch 1 through 5; the validity flags show whether each has settled.
 
-This project is a **Multi-Switch WiZ Smart Bulb Controller** for ESP32. It connects to your WiFi network and allows you to control 6 WiZ smart bulbs using 5 physical toggle switches.
+## Normal operation (after inputs pass)
 
-### Features
+Disable the input-only option, configure WiFi if needed, then build/flash again. Bulbs need mains power and must be accessible on the same local network; the switches carry GPIO signals only.
 
-- **WiFi Connectivity**: Connects to your local WiFi network using credentials from `wifi_config.h`
-- **Multi-Bulb Control**: Controls 6 WiZ smart bulbs via UDP protocol (port 38899)
-- **5 Toggle Switches**: Physical toggle switches for intuitive bulb control
-- **Reliable Detection**: Hybrid polling + interrupt system ensures all switch changes are detected
-- **Automatic Retry**: Failed commands are automatically retried up to 3 times
-- **Periodic Sync**: Every 2 seconds, the system syncs bulb states with switch positions
-- **Status LED**: Visual feedback via status LED on GPIO 2
-- **Automatic Reconnection**: Automatically reconnects to WiFi if connection is lost
+- Inputs are sampled every 10 ms, with 50 ms of unchanged samples required to accept an initial state or change.
+- A separate task handles bulb communication. Network timeouts do not block switch sampling.
+- Startup and reconnection discover bulbs before applying settled switch positions.
+- Each bulb is queried and its MAC checked before a state command. Success requires a read-back of the matching bulb's actual state.
+- Commands retry up to three times. An unconfirmed address is discarded and rediscovered.
+- A full scan starts approximately two seconds after the previous scan completes. Unreachable bulbs may delay a scan.
+- **Maintained-switch behavior:** normal mode makes the bulbs follow the switches. An app/schedule change can be overridden by the next scan. This behavior is intentional here but should be confirmed before final assembly.
+- GPIO2 LED: HIGH after a complete successful scan; LOW at startup, on lost WiFi, or on a failed scan. It is a coarse status indicator, not a blink-code interface. Not all boards have an LED on GPIO2.
 
-### Hardware Requirements
+Live tests still needed: correct room mapping and direction, independent control, all switch combinations, controller reboot, bulb power loss/return, WiFi loss/return, and sustained operation.
 
-- An ESP32 development board
-- 5 physical toggle switches (SPST)
-- 6 WiZ smart bulbs connected to the same WiFi network
-- Optional: Status LED on GPIO 2 (many ESP32 boards have a built-in LED)
+## Firmware checks
 
-### Switch Configuration
-
-| Switch # | GPIO Pin | Controls Bulbs (MAC addresses) | Logic |
-|----------|----------|-------------------------------|-------|
-| Switch 1 | GPIO 4   | `d8a01162ba16`, `444f8e308782` | LOW=ON, HIGH=OFF |
-| Switch 2 | GPIO 5   | `d8a01162bc9e` | HIGH=ON, LOW=OFF |
-| Switch 3 | GPIO 18  | `d8a01170b374` | HIGH=ON, LOW=OFF |
-| Switch 4 | GPIO 19  | `444f8e26e796` | HIGH=ON, LOW=OFF |
-| Switch 5 | GPIO 21  | `444f8e26e756` | HIGH=ON, LOW=OFF |
-
-**Note**: Switch 1 uses different logic than switches 2-5 due to wiring differences. See [Wiring Guide](WIRING.md) for detailed connection instructions.
-
-### Configuration
-
-Before building, you need to configure:
-
-1. **WiFi Credentials**: See [WiFi Configuration Setup](#wifi-configuration-setup) above
-2. **Bulb MAC Addresses**: Update the `switches` array in `main/main.c` (lines 52-57) with your bulb MAC addresses.
-
-**Auto-Discovery**:
-The system automatically discovers bulb IP addresses at startup using the configured MAC addresses. This ensures reliable operation even if bulb IP addresses change (DHCP).
-
-To find your WiZ bulb MAC addresses:
-- Check the bulb label
-- Use the WiZ app to view bulb details
-- Use `wizlight discover` tool (Python)
-
-### How It Works
-
-The `app_main()` function initializes the system in the following order:
-
-1. **WiFi Initialization**: Connects to WiFi using credentials from `wifi_config.h`
-2. **Status LED Setup**: Initializes GPIO 2 as output for status indication
-3. **WiFi Connection Wait**: Waits up to 15 seconds for WiFi connection
-4. **UDP Socket Initialization**: Sets up UDP socket for WiZ bulb communication
-5. **Toggle Handler Task**: Creates a task to handle switch state changes
-6. **Toggle Switch GPIO Setup**: Configures all 5 GPIO pins with pull-up resistors and interrupt handlers
-7. **Initial State Sync**: Reads initial switch positions and syncs bulb states
-8. **Ready State**: System ready for operation
-
-**Switch Operation**:
-
-- **Switch 1**: When toggle is ON (closed/LOW), bulbs 2 & 7 turn ON. When OFF (open/HIGH), bulbs turn OFF.
-- **Switches 2-5**: When toggle is ON (closed/LOW), bulbs turn OFF. When OFF (open/HIGH), bulbs turn ON.
-- Switch changes are detected via hybrid polling (100ms) + interrupt system
-- Changes are debounced (50ms) to prevent false triggers
-- Commands are retried up to 3 times if they fail
-- Every 2 seconds, the system automatically syncs bulb states with switch positions
-
-**Status LED Feedback**:
-- 1 blink = Command sent successfully
-- 2 blinks = Error sending command (after retries)
-- 3 blinks = WiFi not connected
-
-**Reliability Features**:
-
-- **Polling**: Primary detection method - polls GPIO every 100ms to catch all changes
-- **Interrupts**: Fast path for immediate response when switches change
-- **Debouncing**: Multiple readings with majority vote to filter noise
-- **Retry Logic**: Failed commands automatically retry with 200ms delays
-- **Periodic Sync**: Ensures bulbs stay in sync even if commands are missed
-
-**Serial Monitor Output**:
-
-- WiFi connection status and IP address
-- Switch initialization and configuration
-- Switch change events with GPIO levels
-- Bulb control commands sent
-- Success/failure status for each command
-- Periodic sync operations (when corrections are needed)
-
-## Example folder contents
-
-The project **sample_project** contains one source file in C language [main.c](main/main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt`
-files that provide set of directives and instructions describing the project's source files and targets
-(executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── main
-│   ├── CMakeLists.txt
-│   ├── main.c                   Main application code
-│   ├── wifi_config.h.example    WiFi configuration template
-│   └── wifi_config.h            Your WiFi credentials (gitignored)
-├── WIRING.md                    Detailed wiring guide for switches
-└── README.md                    This is the file you are currently reading
+```bash
+bash tests/run_host_tests.sh
+idf.py build
 ```
 
-### Key Files
+Host regression tests cover contact bounce, initial settling, independent inputs, clock wrap, polarity, MAC normalization/identity, malformed/error responses, and duplicate assignments. They use the bundled ESP-IDF cJSON implementation with address/undefined-behavior sanitizers. Set `IDF_PATH` if ESP-IDF is installed elsewhere.
 
-- **main/main.c**: Main application code containing:
-  - WiFi initialization and connection handling
-  - UDP socket management for WiZ bulb communication
-  - Switch GPIO configuration and interrupt handlers
-  - Switch state polling and change detection
-  - Bulb control logic with retry mechanism
-  - Periodic sync functionality
+A successful build or host test does not validate the physical wiring or bulb behavior.
 
-- **main/wifi_config.h**: Your WiFi credentials (not in git)
-- **WIRING.md**: Complete wiring instructions for connecting 5 toggle switches
+## Files
 
-Additionally, the sample project contains Makefile and component.mk files, used for the legacy Make based build system.
-They are not used or needed when building with CMake and idf.py.
+- `main/main.c`: input sampler, network worker, discovery, communication, startup.
+- `main/controller_config.h`: editable GPIO/MAC/polarity assignments.
+- `main/controller_logic.c`: debounce and switch-direction logic.
+- `main/wiz_protocol.c`: MAC and response validation.
+- `main/Kconfig.projbuild`: switch-only diagnostic setting.
+- `AGENTS.md`: working instructions for future coding sessions.
+- `materials.csv`: user's available materials; not a wiring schematic.
+
+GPIO5 and GPIO2 are ESP32 strapping pins. Review their physical connections before soldering; do not change GPIO assignments without moving the matching wire. See [Espressif GPIO reference](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/peripherals/gpio.html). WiZ UDP message examples are documented by [pywizlight](https://github.com/sbidy/pywizlight).

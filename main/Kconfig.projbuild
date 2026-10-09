@@ -1,0 +1,11 @@
+menu "WiZ controller"
+
+config ESP0_INPUT_TEST_ONLY
+    bool "Switch input test only (no WiFi or bulb commands)"
+    default n
+    help
+        Log raw GPIO edges and debounced switch states without connecting to
+        WiFi or sending commands. Use this to verify each switch independently
+        before live bulb tests or soldering. Disable for normal operation.
+
+endmenu
